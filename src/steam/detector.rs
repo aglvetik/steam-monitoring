@@ -64,6 +64,29 @@ pub enum PromotionEvaluation {
     Skipped(PromotionSkipReason),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidatePrefilterDecision {
+    Passed,
+    MissingPriceData,
+    Skipped,
+}
+
+pub fn prefilter_candidate(candidate: &SteamCandidate) -> CandidatePrefilterDecision {
+    let (Some(regular_price), Some(final_price), Some(discount_percent)) = (
+        candidate.regular_price_cents,
+        candidate.final_price_cents,
+        candidate.discount_percent,
+    ) else {
+        return CandidatePrefilterDecision::MissingPriceData;
+    };
+
+    if regular_price > 0 && final_price == 0 && discount_percent == 100 {
+        CandidatePrefilterDecision::Passed
+    } else {
+        CandidatePrefilterDecision::Skipped
+    }
+}
+
 pub fn evaluate_free_promotion(
     details: &SteamAppData,
     candidate: Option<&SteamCandidate>,

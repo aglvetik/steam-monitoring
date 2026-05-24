@@ -499,19 +499,36 @@ fn format_check_summary(summary: &CheckSummary) -> String {
     let mut lines = vec![
         "Проверка Steam завершена.".to_string(),
         format!("Кандидатов от Steam: {}", summary.candidate_app_ids),
-        format!("Детали получены: {}", summary.app_details_fetched),
+        format!("Прошли prefilter: {}", summary.passed_prefilter),
+        format!("Пропущено prefilter: {}", summary.skipped_by_prefilter),
         format!(
-            "Данные Steam недоступны: {}",
-            summary.app_details_unavailable
+            "Нет данных цены в candidate: {}",
+            summary.missing_candidate_price_data
         ),
+        format!("Запросов appdetails: {}", summary.appdetails_requests),
+        format!("Детали получены: {}", summary.app_details_fetched),
         format!("Ограничение Steam / 429: {}", summary.rate_limited),
-        format!("Пропущено: {}", summary.skipped_apps),
         format!("Валидных акций: {}", summary.valid_free_promotions),
-        format!("Попыток публикации: {}", summary.posts_attempted),
-        format!("Успешно отправлено: {}", summary.posts_successfully_sent),
-        format!("Дубликатов пропущено: {}", summary.duplicate_posts_skipped),
+        format!(
+            "Опубликовано сообщений: {}",
+            summary.posts_successfully_sent
+        ),
         format!("Ошибок: {}", summary.errors),
     ];
+
+    if summary.app_details_unavailable > 0 {
+        lines.push(format!(
+            "Данные Steam недоступны: {}",
+            summary.app_details_unavailable
+        ));
+    }
+
+    if summary.duplicate_posts_skipped > 0 {
+        lines.push(format!(
+            "Дубликатов пропущено: {}",
+            summary.duplicate_posts_skipped
+        ));
+    }
 
     if !summary.skip_breakdown.is_empty() {
         let mut breakdown = summary

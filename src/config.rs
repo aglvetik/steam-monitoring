@@ -13,8 +13,6 @@ pub struct Config {
     pub deepseek_model: String,
     pub steam_country: String,
     pub steam_language: String,
-    pub steam_appdetails_batch_size: usize,
-    pub steam_appdetails_batch_delay_ms: u64,
     pub check_interval_minutes: u64,
     pub run_startup_check: bool,
     pub database_url: String,
@@ -33,15 +31,6 @@ impl Config {
             env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
         let steam_country = env::var("STEAM_COUNTRY").unwrap_or_else(|_| "DE".to_string());
         let steam_language = env::var("STEAM_LANGUAGE").unwrap_or_else(|_| "russian".to_string());
-        let steam_appdetails_batch_size = env::var("STEAM_APPDETAILS_BATCH_SIZE")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(50);
-        let steam_appdetails_batch_delay_ms = env::var("STEAM_APPDETAILS_BATCH_DELAY_MS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(1200);
         let check_interval_minutes = env::var("CHECK_INTERVAL_MINUTES")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
@@ -68,8 +57,6 @@ impl Config {
             deepseek_model,
             steam_country,
             steam_language,
-            steam_appdetails_batch_size,
-            steam_appdetails_batch_delay_ms,
             check_interval_minutes,
             run_startup_check,
             database_url,

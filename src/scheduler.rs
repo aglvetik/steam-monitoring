@@ -12,18 +12,24 @@ use crate::{
     deepseek::{client::DeepSeekClient, AiDescription},
     error::{AppError, AppResult},
     steam::{
-        AppDetailsResult, FreePromotion, PromotionEvaluation, PromotionSkipReason, SteamCandidate,
-        SteamClient,
+        prefilter_candidate, AppDetailsResult, CandidatePrefilterDecision, FreePromotion,
+        PromotionEvaluation, PromotionSkipReason, SteamCandidate, SteamClient,
     },
     telegram::{formatting::build_post, publisher::TelegramPublisher},
     utils::time::parse_rfc3339_utc,
 };
+
+const APPDETAILS_REQUEST_DELAY_MS: u64 = 300;
 
 #[derive(Debug, Clone, Default)]
 pub struct CheckSummary {
     pub reason: String,
     pub target_chats: usize,
     pub candidate_app_ids: usize,
+    pub passed_prefilter: usize,
+    pub skipped_by_prefilter: usize,
+    pub missing_candidate_price_data: usize,
+    pub appdetails_requests: usize,
     pub app_details_fetched: usize,
     pub app_details_unavailable: usize,
     pub rate_limited: usize,
@@ -58,6 +64,9 @@ impl CheckSummary {
         if self.target_chats == 0 && self.valid_free_promotions > 0 {
             return Some("нет включенных чатов для публикации.");
         }
+        if self.passed_prefilter == 0 && self.errors == 0 {
+            return Some("по данным Steam сейчас не найдено кандидатов с 100% скидкой и ценой 0.");
+        }
         if self.valid_free_promotions == 0 && self.errors == 0 {
             return Some("временно бесплатных платных игр сейчас не найдено.");
         }
@@ -87,8 +96,6 @@ pub struct CheckRunner {
     deepseek: Arc<DeepSeekClient>,
     publisher: Arc<TelegramPublisher>,
     main_channel_id: Option<String>,
-    steam_appdetails_batch_size: usize,
-    steam_appdetails_batch_delay_ms: u64,
     run_lock: Arc<Mutex<()>>,
 }
 
@@ -99,8 +106,6 @@ impl CheckRunner {
         deepseek: Arc<DeepSeekClient>,
         publisher: Arc<TelegramPublisher>,
         main_channel_id: Option<String>,
-        steam_appdetails_batch_size: usize,
-        steam_appdetails_batch_delay_ms: u64,
     ) -> Self {
         Self {
             repo,
@@ -108,8 +113,6 @@ impl CheckRunner {
             deepseek,
             publisher,
             main_channel_id,
-            steam_appdetails_batch_size,
-            steam_appdetails_batch_delay_ms,
             run_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -150,8 +153,10 @@ impl CheckRunner {
             .await?;
         summary.target_chats = target_chat_ids.len();
 
-        let active_events = self.repo.list_active_price_events().await?;
-        let active_map = active_events
+        let active_map = self
+            .repo
+            .list_active_price_events()
+            .await?
             .into_iter()
             .map(|event| (event.appid, event))
             .collect::<HashMap<_, _>>();
@@ -166,98 +171,81 @@ impl CheckRunner {
                 return Ok(summary);
             }
         };
-        summary.candidate_app_ids = fetched_candidates.len();
         info!(
             reason = reason,
-            candidate_count = summary.candidate_app_ids,
+            candidate_count = fetched_candidates.len(),
             "Steam candidate fetch finished"
         );
 
-        let mut candidate_map = fetched_candidates
-            .into_iter()
-            .map(|candidate| (candidate.appid, candidate))
-            .collect::<HashMap<_, _>>();
-
-        for (appid, active_event) in &active_map {
+        let mut candidate_map = HashMap::new();
+        for candidate in fetched_candidates {
             candidate_map
-                .entry(*appid)
-                .or_insert_with(|| SteamCandidate {
-                    appid: *appid,
-                    source: "active_recheck".to_string(),
-                    free_until: active_event
-                        .free_until
-                        .as_deref()
-                        .and_then(parse_rfc3339_utc),
-                    ..SteamCandidate::default()
-                });
+                .entry(candidate.appid)
+                .and_modify(|existing: &mut SteamCandidate| existing.merge_from(candidate.clone()))
+                .or_insert(candidate);
         }
 
-        let mut appids = candidate_map.keys().copied().collect::<Vec<_>>();
-        appids.sort_unstable();
+        let mut candidates = candidate_map.into_values().collect::<Vec<_>>();
+        candidates.sort_by_key(|candidate| candidate.appid);
+        summary.candidate_app_ids = candidates.len();
 
-        let batch_size = self.steam_appdetails_batch_size.max(1);
+        let mut prefiltered_candidates = Vec::new();
+        for candidate in candidates {
+            match prefilter_candidate(&candidate) {
+                CandidatePrefilterDecision::Passed => {
+                    summary.passed_prefilter += 1;
+                    prefiltered_candidates.push(candidate);
+                }
+                CandidatePrefilterDecision::MissingPriceData => {
+                    summary.missing_candidate_price_data += 1;
+                }
+                CandidatePrefilterDecision::Skipped => {
+                    summary.skipped_by_prefilter += 1;
+                }
+            }
+        }
 
-        for (batch_index, batch) in appids.chunks(batch_size).enumerate() {
-            let batch_u32 = match batch
-                .iter()
-                .copied()
-                .map(|appid| {
-                    u32::try_from(appid).map_err(|_| {
-                        AppError::Other(format!("invalid Steam appid in batch: {appid}"))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()
-            {
-                Ok(batch_u32) => batch_u32,
-                Err(error) => {
+        for (index, candidate) in prefiltered_candidates.iter().enumerate() {
+            let appid = candidate.appid;
+            let appid_u32 = match u32::try_from(appid) {
+                Ok(appid_u32) => appid_u32,
+                Err(_) => {
                     summary.errors += 1;
-                    warn!("Skipping invalid appdetails batch: {error}");
+                    warn!("Skipping invalid prefiltered appid: {appid}");
                     continue;
                 }
             };
 
-            match self.steam.fetch_app_details_batch(&batch_u32).await {
-                Ok(details_map) => {
-                    for appid_u32 in batch_u32 {
-                        let appid = i64::from(appid_u32);
-                        let candidate = candidate_map.get(&appid);
+            summary.appdetails_requests += 1;
 
-                        match details_map.get(&appid_u32) {
-                            Some(AppDetailsResult::Available(details)) => {
-                                summary.app_details_fetched += 1;
-                                self.process_app_details(
-                                    &mut summary,
-                                    &target_chat_ids,
-                                    &active_map,
-                                    candidate,
-                                    appid,
-                                    details.as_ref(),
-                                )
-                                .await;
-                            }
-                            Some(AppDetailsResult::Unavailable) | None => {
-                                summary.app_details_unavailable += 1;
-                                summary.record_skip(PromotionSkipReason::AppDetailsUnavailable);
-                            }
-                            Some(AppDetailsResult::RateLimited) => {
-                                summary.rate_limited += 1;
-                            }
-                        }
-                    }
+            match self.steam.fetch_single_app_details_result(appid_u32).await {
+                Ok(AppDetailsResult::Available(details)) => {
+                    summary.app_details_fetched += 1;
+                    self.process_app_details(
+                        &mut summary,
+                        &target_chat_ids,
+                        &active_map,
+                        candidate,
+                        details.as_ref(),
+                    )
+                    .await;
+                }
+                Ok(AppDetailsResult::Unavailable) => {
+                    summary.app_details_unavailable += 1;
+                    summary.record_skip(PromotionSkipReason::AppDetailsUnavailable);
+                }
+                Ok(AppDetailsResult::RateLimited) => {
+                    summary.rate_limited += 1;
                 }
                 Err(error) => {
                     summary.errors += 1;
-                    warn!(
-                        batch_index,
-                        batch_size = batch.len(),
-                        "Steam appdetails batch failed: {error}"
-                    );
+                    warn!("Steam appdetails request failed for app {appid}: {error}");
                 }
             }
 
-            let has_more_batches = (batch_index + 1) * batch_size < appids.len();
-            if has_more_batches && self.steam_appdetails_batch_delay_ms > 0 {
-                time::sleep(Duration::from_millis(self.steam_appdetails_batch_delay_ms)).await;
+            let has_more_requests = index + 1 < prefiltered_candidates.len();
+            if has_more_requests {
+                time::sleep(Duration::from_millis(APPDETAILS_REQUEST_DELAY_MS)).await;
             }
         }
 
@@ -265,6 +253,10 @@ impl CheckRunner {
             reason = %summary.reason,
             target_chats = summary.target_chats,
             candidate_app_ids = summary.candidate_app_ids,
+            passed_prefilter = summary.passed_prefilter,
+            skipped_by_prefilter = summary.skipped_by_prefilter,
+            missing_candidate_price_data = summary.missing_candidate_price_data,
+            appdetails_requests = summary.appdetails_requests,
             app_details_fetched = summary.app_details_fetched,
             app_details_unavailable = summary.app_details_unavailable,
             rate_limited = summary.rate_limited,
@@ -285,11 +277,10 @@ impl CheckRunner {
         summary: &mut CheckSummary,
         target_chat_ids: &[String],
         active_map: &HashMap<i64, PriceEventRecord>,
-        candidate: Option<&SteamCandidate>,
-        appid: i64,
+        candidate: &SteamCandidate,
         details: &crate::steam::SteamAppData,
     ) {
-        let game = self.steam.build_game_data(details, candidate);
+        let game = self.steam.build_game_data(details, Some(candidate));
         if let Err(error) = self.repo.upsert_game(&game).await {
             summary.errors += 1;
             warn!(
@@ -299,7 +290,7 @@ impl CheckRunner {
             return;
         }
 
-        match self.steam.evaluate_free_promotion(details, candidate) {
+        match self.steam.evaluate_free_promotion(details, Some(candidate)) {
             PromotionEvaluation::Publishable(mut promotion) => {
                 summary.valid_free_promotions += 1;
 
@@ -413,10 +404,17 @@ impl CheckRunner {
             PromotionEvaluation::Skipped(reason) => {
                 summary.record_skip(reason);
 
-                if active_map.contains_key(&appid) {
-                    if let Err(error) = self.repo.end_active_price_events_for_app(appid).await {
+                if active_map.contains_key(&candidate.appid) {
+                    if let Err(error) = self
+                        .repo
+                        .end_active_price_events_for_app(candidate.appid)
+                        .await
+                    {
                         summary.errors += 1;
-                        warn!("Failed to close active promotion for app {appid}: {error}");
+                        warn!(
+                            "Failed to close active promotion for app {}: {error}",
+                            candidate.appid
+                        );
                     }
                 }
             }

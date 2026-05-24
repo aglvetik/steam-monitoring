@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use crate::{error::AppResult, utils::time::unix_timestamp_to_utc};
 
-use super::{client::SteamClient, models::SearchResultsResponse, SteamCandidate};
+use super::{client::SteamClient, SteamCandidate};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FeaturedCategoriesSource;
@@ -43,65 +43,6 @@ impl FeaturedCategoriesSource {
         }
 
         candidates
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct SearchSpecialsSource {
-    max_pages: usize,
-    page_size: usize,
-}
-
-impl SearchSpecialsSource {
-    pub fn new(max_pages: usize, page_size: usize) -> Self {
-        Self {
-            max_pages,
-            page_size,
-        }
-    }
-
-    pub fn name(&self) -> &'static str {
-        "search_specials"
-    }
-
-    pub async fn fetch(&self, client: &SteamClient) -> AppResult<Vec<SteamCandidate>> {
-        let regex = Regex::new(r#"data-ds-appid="(?P<id>\d+)""#)
-            .expect("static regex for Steam app ids is valid");
-        let mut candidates = Vec::new();
-
-        for page in 0..self.max_pages {
-            let start = page * self.page_size;
-            let url = format!(
-                "https://store.steampowered.com/search/results/?specials=1&category1=998&hidef2p=1&ndl=1&infinite=1&start={start}&count={count}&cc={cc}&l={lang}",
-                count = self.page_size,
-                cc = client.country(),
-                lang = client.language(),
-            );
-            let payload = client.get_json::<SearchResultsResponse>(&url).await?;
-            if payload.success != 1 {
-                break;
-            }
-
-            let mut page_hits = 0usize;
-            for capture in regex.captures_iter(&payload.results_html) {
-                if let Some(raw_id) = capture.name("id") {
-                    if let Ok(appid) = raw_id.as_str().parse::<i64>() {
-                        candidates.push(SteamCandidate {
-                            appid,
-                            source: self.name().to_string(),
-                            ..SteamCandidate::default()
-                        });
-                        page_hits += 1;
-                    }
-                }
-            }
-
-            if page_hits == 0 || (payload.start + self.page_size as i64) >= payload.total_count {
-                break;
-            }
-        }
-
-        Ok(candidates)
     }
 }
 
