@@ -13,6 +13,10 @@ pub struct Config {
     pub deepseek_model: String,
     pub steam_country: String,
     pub steam_language: String,
+    pub enable_steamdb_source: bool,
+    pub steamdb_free_promotions_url: String,
+    pub steamdb_user_agent: String,
+    pub steamdb_timeout_seconds: u64,
     pub check_interval_minutes: u64,
     pub run_startup_check: bool,
     pub database_url: String,
@@ -31,6 +35,24 @@ impl Config {
             env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
         let steam_country = env::var("STEAM_COUNTRY").unwrap_or_else(|_| "DE".to_string());
         let steam_language = env::var("STEAM_LANGUAGE").unwrap_or_else(|_| "russian".to_string());
+        let enable_steamdb_source = env::var("ENABLE_STEAMDB_SOURCE")
+            .ok()
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(true);
+        let steamdb_free_promotions_url = env::var("STEAMDB_FREE_PROMOTIONS_URL")
+            .unwrap_or_else(|_| "https://steamdb.info/upcoming/free/".to_string());
+        let steamdb_user_agent = env::var("STEAMDB_USER_AGENT")
+            .unwrap_or_else(|_| "steam-free-games-bot/0.1 contact: telegram".to_string());
+        let steamdb_timeout_seconds = env::var("STEAMDB_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(20);
         let check_interval_minutes = env::var("CHECK_INTERVAL_MINUTES")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
@@ -57,6 +79,10 @@ impl Config {
             deepseek_model,
             steam_country,
             steam_language,
+            enable_steamdb_source,
+            steamdb_free_promotions_url,
+            steamdb_user_agent,
+            steamdb_timeout_seconds,
             check_interval_minutes,
             run_startup_check,
             database_url,

@@ -8,6 +8,7 @@ pub enum TelegramCommand {
     Status,
     CheckNow,
     DebugSteamHttp,
+    DebugSteamDb,
     TestPost,
     PreviewApp { appid: Option<String> },
 }
@@ -49,6 +50,7 @@ impl TelegramCommand {
             "status" => Some(Self::Status),
             "check_now" => Some(Self::CheckNow),
             "debug_steam_http" => Some(Self::DebugSteamHttp),
+            "debug_steamdb" => Some(Self::DebugSteamDb),
             "test_post" => Some(Self::TestPost),
             "preview_app" => Some(Self::PreviewApp {
                 appid: if args.is_empty() { None } else { Some(args) },

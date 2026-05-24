@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use reqwest::Client;
 use serde::de::DeserializeOwned;
@@ -8,7 +9,10 @@ use tracing::{debug, warn};
 use crate::error::{AppError, AppResult};
 
 use super::{
-    detector, models::SteamAppDetailsEnvelope, sources::FeaturedCategoriesSource,
+    detector,
+    models::SteamAppDetailsEnvelope,
+    sources::FeaturedCategoriesSource,
+    steamdb::{SteamDbFreePromotionsReport, SteamDbFreePromotionsSource},
     PromotionEvaluation, SteamAppData, SteamCandidate, SteamGameData,
 };
 
@@ -35,13 +39,28 @@ pub struct SteamClient {
     language: String,
     http: Client,
     featured_source: FeaturedCategoriesSource,
+    steamdb_enabled: bool,
+    steamdb_http: Client,
+    steamdb_source: SteamDbFreePromotionsSource,
 }
 
 impl SteamClient {
-    pub fn new(country: String, language: String) -> AppResult<Self> {
+    pub fn new(
+        country: String,
+        language: String,
+        steamdb_enabled: bool,
+        steamdb_url: String,
+        steamdb_user_agent: String,
+        steamdb_timeout_seconds: u64,
+    ) -> AppResult<Self> {
         let http = Client::builder()
             .user_agent("steam-free-games-bot/0.1")
             .no_proxy()
+            .build()?;
+        let steamdb_http = Client::builder()
+            .user_agent(steamdb_user_agent)
+            .no_proxy()
+            .timeout(Duration::from_secs(steamdb_timeout_seconds.max(1)))
             .build()?;
 
         Ok(Self {
@@ -49,6 +68,9 @@ impl SteamClient {
             language,
             http,
             featured_source: FeaturedCategoriesSource,
+            steamdb_enabled,
+            steamdb_http,
+            steamdb_source: SteamDbFreePromotionsSource::new(steamdb_url),
         })
     }
 
@@ -64,6 +86,18 @@ impl SteamClient {
         let mut values = self.featured_source.fetch(self).await?;
         values.sort_by_key(|item| item.appid);
         Ok(values)
+    }
+
+    pub async fn fetch_steamdb_free_promotions(&self) -> SteamDbFreePromotionsReport {
+        if !self.steamdb_enabled {
+            return SteamDbFreePromotionsReport {
+                url: self.steamdb_source.url().to_string(),
+                error: Some("SteamDB source is disabled by config.".to_string()),
+                ..SteamDbFreePromotionsReport::default()
+            };
+        }
+
+        self.steamdb_source.fetch(&self.steamdb_http).await
     }
 
     pub async fn fetch_app_details(&self, appid: i64) -> AppResult<Option<SteamAppData>> {
@@ -187,6 +221,10 @@ impl SteamClient {
             stage: "done",
             error: None,
         }
+    }
+
+    pub async fn debug_steamdb_free_promotions(&self) -> SteamDbFreePromotionsReport {
+        self.fetch_steamdb_free_promotions().await
     }
 
     pub(crate) async fn get_json<T>(&self, url: &str) -> AppResult<T>

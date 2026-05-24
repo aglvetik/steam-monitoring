@@ -107,14 +107,20 @@ fn compose_post(
     tags_limit: usize,
 ) -> String {
     let title = escape_html(&game.name);
-    let regular_price = escape_html(&format_price(
-        promotion.regular_price_cents.unwrap_or_default(),
-        promotion.currency.as_deref(),
-    ));
     let final_price = escape_html(&format_price(
         promotion.final_price_cents.unwrap_or_default(),
         promotion.currency.as_deref(),
     ));
+    let price_line = match promotion.regular_price_cents {
+        Some(regular_price_cents) => {
+            let regular_price = escape_html(&format_price(
+                regular_price_cents,
+                promotion.currency.as_deref(),
+            ));
+            format!("💸 <s>{regular_price}</s> → <b>{final_price}</b>")
+        }
+        None => format!("💸 <b>{final_price}</b> <i>бесплатно по акции</i>"),
+    };
     let free_until_line = format_free_until_line(promotion);
     let short_description = escape_html(&truncate_chars(ai.short_description.trim(), short_limit));
     let why_play = escape_html(&truncate_chars(ai.why_play.trim(), why_limit));
@@ -128,7 +134,7 @@ fn compose_post(
     let steam_url = escape_html(&game.steam_url);
 
     format!(
-        "🎮 <b>{title}</b>\n\n💸 <s>{regular_price}</s> → <b>{final_price}</b>\n⏳ {free_until_line}\n\n🧠 <b>Коротко:</b>\n{short_description}\n\n✨ <b>Почему может понравиться:</b>\n{why_play}\n\n🏷 {tags_line}\n\n🔗 <a href=\"{steam_url}\">Забрать в Steam</a>"
+        "🎮 <b>{title}</b>\n\n{price_line}\n⏳ {free_until_line}\n\n🧠 <b>Коротко:</b>\n{short_description}\n\n✨ <b>Почему может понравиться:</b>\n{why_play}\n\n🏷 {tags_line}\n\n🔗 <a href=\"{steam_url}\">Забрать в Steam</a>"
     )
 }
 
@@ -193,5 +199,45 @@ mod tests {
         assert!(post
             .message_html
             .contains("<a href=\"https://store.steampowered.com/\">Забрать в Steam</a>"));
+    }
+
+    #[test]
+    fn build_post_supports_unknown_regular_price() {
+        let game = SteamGameData {
+            appid: 2,
+            name: "Unknown Price Game".to_string(),
+            steam_url: "https://store.steampowered.com/app/2/".to_string(),
+            kind: Some("game".to_string()),
+            is_free_to_play: false,
+            header_image: None,
+            capsule_image: None,
+            short_description: None,
+            genres: Vec::new(),
+            categories: Vec::new(),
+        };
+        let promotion = FreePromotion {
+            appid: 2,
+            currency: None,
+            regular_price_cents: None,
+            final_price_cents: Some(0),
+            discount_percent: None,
+            free_until: None,
+            source: "steamdb_free_to_keep".to_string(),
+        };
+        let ai = AiDescription {
+            appid: 2,
+            language: "russian".to_string(),
+            short_description: "Описание".to_string(),
+            why_play: "Почему стоит".to_string(),
+            tags_line: Some("Тест / SteamDB".to_string()),
+            model: None,
+        };
+
+        let post = build_post(&game, &promotion, &ai);
+
+        assert!(post
+            .message_html
+            .contains("💸 <b>0 €</b> <i>бесплатно по акции</i>"));
+        assert!(!post.message_html.contains("<s>0 €</s>"));
     }
 }

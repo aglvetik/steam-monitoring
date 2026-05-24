@@ -18,10 +18,10 @@ use crate::{
     error::AppResult,
     scheduler::{CheckRunner, CheckSummary},
     steam::{
-        FreePromotion, PromotionEvaluation, PromotionSkipReason, SteamClient, SteamGameData,
-        SteamHttpDebugReport,
+        FreePromotion, PromotionEvaluation, PromotionSkipReason, SteamClient,
+        SteamDbFreePromotionsReport, SteamGameData, SteamHttpDebugReport,
     },
-    utils::html::truncate_chars,
+    utils::{html::truncate_chars, time::format_berlin_datetime},
 };
 
 use super::{
@@ -119,6 +119,7 @@ async fn handle_command(
         TelegramCommand::Status => handle_status(bot, msg, repo, config).await,
         TelegramCommand::CheckNow => handle_check_now(bot, msg, config, check_runner).await,
         TelegramCommand::DebugSteamHttp => handle_debug_steam_http(bot, msg, config, steam).await,
+        TelegramCommand::DebugSteamDb => handle_debug_steamdb(bot, msg, config, steam).await,
         TelegramCommand::TestPost => handle_test_post(bot, msg, repo, config).await,
         TelegramCommand::PreviewApp { appid } => {
             handle_preview_app(bot, msg, config, steam, appid).await
@@ -300,6 +301,38 @@ async fn handle_debug_steam_http(
         msg.chat.id,
         format_debug_report(&report),
         "Failed to send /debug_steam_http reply",
+    )
+    .await;
+    Ok(())
+}
+
+async fn handle_debug_steamdb(
+    bot: &Bot,
+    msg: &Message,
+    config: &Config,
+    steam: &SteamClient,
+) -> AppResult<()> {
+    if !ensure_admin(bot, msg, config).await? {
+        return Ok(());
+    }
+
+    if !msg.chat.is_private() {
+        send_admin_reply(
+            bot,
+            msg.chat.id,
+            "Выполните /debug_steamdb в личном чате с ботом.",
+            "Failed to send /debug_steamdb private-chat hint",
+        )
+        .await;
+        return Ok(());
+    }
+
+    let report = steam.debug_steamdb_free_promotions().await;
+    send_admin_reply(
+        bot,
+        msg.chat.id,
+        format_steamdb_debug_report(&report),
+        "Failed to send /debug_steamdb reply",
     )
     .await;
     Ok(())
@@ -498,21 +531,26 @@ async fn ensure_admin(bot: &Bot, msg: &Message, config: &Config) -> AppResult<bo
 fn format_check_summary(summary: &CheckSummary) -> String {
     let mut lines = vec![
         "Проверка Steam завершена.".to_string(),
-        format!("Кандидатов от Steam: {}", summary.candidate_app_ids),
-        format!("Прошли prefilter: {}", summary.passed_prefilter),
-        format!("Пропущено prefilter: {}", summary.skipped_by_prefilter),
+        format!("Steam candidates: {}", summary.steam_candidate_app_ids),
+        format!("Steam prefilter passed: {}", summary.steam_prefilter_passed),
         format!(
-            "Нет данных цены в candidate: {}",
-            summary.missing_candidate_price_data
+            "Steam prefilter skipped: {}",
+            summary.steam_prefilter_skipped
         ),
+        format!(
+            "Steam без данных цены: {}",
+            summary.steam_missing_candidate_price_data
+        ),
+        format!("SteamDB entries parsed: {}", summary.steamdb_entries_parsed),
+        format!("SteamDB Free to Keep: {}", summary.steamdb_free_to_keep),
         format!("Запросов appdetails: {}", summary.appdetails_requests),
         format!("Детали получены: {}", summary.app_details_fetched),
-        format!("Ограничение Steam / 429: {}", summary.rate_limited),
         format!("Валидных акций: {}", summary.valid_free_promotions),
         format!(
             "Опубликовано сообщений: {}",
             summary.posts_successfully_sent
         ),
+        format!("Дубликатов пропущено: {}", summary.duplicate_posts_skipped),
         format!("Ошибок: {}", summary.errors),
     ];
 
@@ -523,10 +561,18 @@ fn format_check_summary(summary: &CheckSummary) -> String {
         ));
     }
 
-    if summary.duplicate_posts_skipped > 0 {
+    if summary.rate_limited > 0 {
+        lines.push(format!("Ограничение Steam / 429: {}", summary.rate_limited));
+    }
+
+    if summary.steamdb_source_error.is_some() {
+        lines.push("SteamDB: ошибка загрузки, источник пропущен.".to_string());
+    }
+
+    if summary.steamdb_parse_errors > 0 {
         lines.push(format!(
-            "Дубликатов пропущено: {}",
-            summary.duplicate_posts_skipped
+            "SteamDB parse errors: {}",
+            summary.steamdb_parse_errors
         ));
     }
 
@@ -561,6 +607,55 @@ fn format_check_summary(summary: &CheckSummary) -> String {
             "Steam временно ограничил часть запросов. Следующая проверка попробует снова."
                 .to_string(),
         );
+    }
+
+    lines.join("\n")
+}
+
+fn format_steamdb_debug_report(report: &SteamDbFreePromotionsReport) -> String {
+    let mut lines = vec![
+        format!("SteamDB URL: {}", report.url),
+        format!("SteamDB entries parsed: {}", report.entries_parsed),
+        format!("Free to Keep accepted: {}", report.free_to_keep_accepted),
+        format!("Play For Free skipped: {}", report.play_for_free_skipped),
+        format!("Missing appid skipped: {}", report.missing_appid_skipped),
+        format!("Expired skipped: {}", report.expired_skipped),
+        format!("Parse errors: {}", report.parse_errors),
+    ];
+
+    if report.obvious_non_game_skipped > 0 {
+        lines.push(format!(
+            "Obvious non-game skipped: {}",
+            report.obvious_non_game_skipped
+        ));
+    }
+
+    if let Some(bytes) = report.response_bytes {
+        lines.push(format!("Response bytes: {bytes}"));
+    }
+
+    if let Some(error) = report.error.as_deref() {
+        lines.push(format!("Error: {error}"));
+    }
+
+    if !report.accepted_entries.is_empty() {
+        lines.push(String::new());
+        lines.push("Accepted entries:".to_string());
+
+        for entry in report.accepted_entries.iter().take(10) {
+            let started = entry
+                .started_at
+                .map(|value| format_berlin_datetime(&value))
+                .unwrap_or_else(|| "не указано".to_string());
+            let expires = entry
+                .expires_at
+                .map(|value| format_berlin_datetime(&value))
+                .unwrap_or_else(|| "не указано".to_string());
+            lines.push(format!(
+                "- {} | {} | старт: {} | до: {} | {}",
+                entry.appid, entry.name, started, expires, entry.store_url
+            ));
+        }
     }
 
     lines.join("\n")

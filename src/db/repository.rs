@@ -209,6 +209,37 @@ impl Repository {
         &self,
         promotion: &FreePromotion,
     ) -> AppResult<PriceEventRecord> {
+        if let Some(free_until) = promotion.free_until_rfc3339() {
+            if let Some(existing) = query_as::<_, PriceEventRecord>(
+                r#"
+                SELECT
+                    id,
+                    appid,
+                    currency,
+                    regular_price_cents,
+                    final_price_cents,
+                    discount_percent,
+                    free_until,
+                    source,
+                    detected_at,
+                    ended_at
+                FROM price_events
+                WHERE appid = ?1
+                  AND ended_at IS NULL
+                  AND COALESCE(free_until, '') = ?2
+                ORDER BY detected_at DESC
+                LIMIT 1
+                "#,
+            )
+            .bind(promotion.appid)
+            .bind(&free_until)
+            .fetch_optional(&self.pool)
+            .await?
+            {
+                return Ok(existing);
+            }
+        }
+
         if let Some(existing) = query_as::<_, PriceEventRecord>(
             r#"
             SELECT

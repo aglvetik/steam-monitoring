@@ -42,6 +42,10 @@ async fn main() -> AppResult<()> {
     let steam_client = Arc::new(steam::SteamClient::new(
         config.steam_country.clone(),
         config.steam_language.clone(),
+        config.enable_steamdb_source,
+        config.steamdb_free_promotions_url.clone(),
+        config.steamdb_user_agent.clone(),
+        config.steamdb_timeout_seconds,
     )?);
     let deepseek_client = Arc::new(deepseek::client::DeepSeekClient::new(
         config.deepseek_api_key.clone(),

@@ -11,6 +11,7 @@ dotenvy = "0.15"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 reqwest_011 = { package = "reqwest", version = "0.11.27", default-features = false, features = ["json", "rustls-tls"] }
+scraper = "0.24"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlx = { version = "0.8", features = ["chrono", "migrate", "runtime-tokio-rustls", "sqlite"] }

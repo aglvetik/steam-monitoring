@@ -87,6 +87,23 @@ pub fn prefilter_candidate(candidate: &SteamCandidate) -> CandidatePrefilterDeci
     }
 }
 
+pub fn looks_like_excluded_title(title: &str) -> bool {
+    let normalized = title.to_ascii_lowercase();
+    let blocked_keywords = [
+        "soundtrack",
+        "ost",
+        "dlc",
+        "demo",
+        "software",
+        "tool",
+        "editor",
+    ];
+
+    blocked_keywords
+        .iter()
+        .any(|keyword| normalized.contains(keyword))
+}
+
 pub fn evaluate_free_promotion(
     details: &SteamAppData,
     candidate: Option<&SteamCandidate>,

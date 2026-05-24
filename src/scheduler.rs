@@ -12,8 +12,9 @@ use crate::{
     deepseek::{client::DeepSeekClient, AiDescription},
     error::{AppError, AppResult},
     steam::{
-        prefilter_candidate, AppDetailsResult, CandidatePrefilterDecision, FreePromotion,
-        PromotionEvaluation, PromotionSkipReason, SteamCandidate, SteamClient,
+        looks_like_excluded_title, prefilter_candidate, AppDetailsResult,
+        CandidatePrefilterDecision, FreePromotion, PromotionEvaluation, PromotionSkipReason,
+        SteamCandidate, SteamClient, SteamDbPromotionEntry, STEAMDB_FREE_TO_KEEP_SOURCE_NAME,
     },
     telegram::{formatting::build_post, publisher::TelegramPublisher},
     utils::time::parse_rfc3339_utc,
@@ -25,10 +26,17 @@ const APPDETAILS_REQUEST_DELAY_MS: u64 = 300;
 pub struct CheckSummary {
     pub reason: String,
     pub target_chats: usize,
-    pub candidate_app_ids: usize,
-    pub passed_prefilter: usize,
-    pub skipped_by_prefilter: usize,
-    pub missing_candidate_price_data: usize,
+    pub steam_candidate_app_ids: usize,
+    pub steam_prefilter_passed: usize,
+    pub steam_prefilter_skipped: usize,
+    pub steam_missing_candidate_price_data: usize,
+    pub steamdb_entries_parsed: usize,
+    pub steamdb_free_to_keep: usize,
+    pub steamdb_play_for_free_skipped: usize,
+    pub steamdb_missing_appid_skipped: usize,
+    pub steamdb_expired_skipped: usize,
+    pub steamdb_parse_errors: usize,
+    pub steamdb_source_error: Option<String>,
     pub appdetails_requests: usize,
     pub app_details_fetched: usize,
     pub app_details_unavailable: usize,
@@ -58,17 +66,17 @@ impl CheckSummary {
         if self.posts_successfully_sent > 0 {
             return None;
         }
+        if self.steam_request_failed && self.steamdb_source_error.is_some() {
+            return Some("не удалось получить данные из подключённых источников.");
+        }
         if self.steam_request_failed {
             return Some("не удалось получить данные Steam.");
         }
         if self.target_chats == 0 && self.valid_free_promotions > 0 {
-            return Some("нет включенных чатов для публикации.");
-        }
-        if self.passed_prefilter == 0 && self.errors == 0 {
-            return Some("по данным Steam сейчас не найдено кандидатов с 100% скидкой и ценой 0.");
+            return Some("нет включённых чатов для публикации.");
         }
         if self.valid_free_promotions == 0 && self.errors == 0 {
-            return Some("временно бесплатных платных игр сейчас не найдено.");
+            return Some("временно бесплатных игр сейчас не найдено в подключённых источниках.");
         }
         if self.posts_attempted == 0 && self.duplicate_posts_skipped > 0 {
             return Some("все валидные акции уже были опубликованы.");
@@ -161,18 +169,84 @@ impl CheckRunner {
             .map(|event| (event.appid, event))
             .collect::<HashMap<_, _>>();
 
-        info!(reason = reason, "Steam candidate fetch starting");
+        let mut steam_candidates = self.fetch_and_prepare_steam_candidates(&mut summary).await;
+
+        let steamdb_report = self.steam.fetch_steamdb_free_promotions().await;
+        summary.steamdb_entries_parsed = steamdb_report.entries_parsed;
+        summary.steamdb_free_to_keep = steamdb_report.free_to_keep_accepted;
+        summary.steamdb_play_for_free_skipped = steamdb_report.play_for_free_skipped;
+        summary.steamdb_missing_appid_skipped = steamdb_report.missing_appid_skipped;
+        summary.steamdb_expired_skipped = steamdb_report.expired_skipped;
+        summary.steamdb_parse_errors = steamdb_report.parse_errors;
+        summary.steamdb_source_error = steamdb_report.error.clone();
+
+        if let Some(error) = summary.steamdb_source_error.as_deref() {
+            warn!("SteamDB source skipped: {error}");
+        }
+
+        self.enrich_steam_candidates_from_steamdb(
+            &mut steam_candidates,
+            &steamdb_report.accepted_entries,
+        );
+
+        let mut appdetails_cache = HashMap::new();
+
+        self.process_steam_prefiltered_candidates(
+            &mut summary,
+            &target_chat_ids,
+            &active_map,
+            &steam_candidates,
+            &mut appdetails_cache,
+        )
+        .await;
+
+        self.process_steamdb_candidates(
+            &mut summary,
+            &target_chat_ids,
+            &active_map,
+            &steamdb_report.accepted_entries,
+            &mut appdetails_cache,
+        )
+        .await;
+
+        info!(
+            reason = %summary.reason,
+            target_chats = summary.target_chats,
+            steam_candidate_app_ids = summary.steam_candidate_app_ids,
+            steam_prefilter_passed = summary.steam_prefilter_passed,
+            steam_prefilter_skipped = summary.steam_prefilter_skipped,
+            steam_missing_candidate_price_data = summary.steam_missing_candidate_price_data,
+            steamdb_entries_parsed = summary.steamdb_entries_parsed,
+            steamdb_free_to_keep = summary.steamdb_free_to_keep,
+            appdetails_requests = summary.appdetails_requests,
+            app_details_fetched = summary.app_details_fetched,
+            rate_limited = summary.rate_limited,
+            valid_free_promotions = summary.valid_free_promotions,
+            posts_successfully_sent = summary.posts_successfully_sent,
+            duplicate_posts_skipped = summary.duplicate_posts_skipped,
+            errors = summary.errors,
+            "Steam check finished"
+        );
+
+        Ok(summary)
+    }
+
+    async fn fetch_and_prepare_steam_candidates(
+        &self,
+        summary: &mut CheckSummary,
+    ) -> Vec<SteamCandidate> {
+        info!(reason = %summary.reason, "Steam candidate fetch starting");
         let fetched_candidates = match self.steam.fetch_candidate_free_promotions().await {
             Ok(candidates) => candidates,
             Err(error) => {
                 summary.errors += 1;
                 summary.steam_request_failed = true;
                 error!("Steam candidate fetch failed: {error}");
-                return Ok(summary);
+                return Vec::new();
             }
         };
         info!(
-            reason = reason,
+            reason = %summary.reason,
             candidate_count = fetched_candidates.len(),
             "Steam candidate fetch finished"
         );
@@ -187,89 +261,178 @@ impl CheckRunner {
 
         let mut candidates = candidate_map.into_values().collect::<Vec<_>>();
         candidates.sort_by_key(|candidate| candidate.appid);
-        summary.candidate_app_ids = candidates.len();
+        summary.steam_candidate_app_ids = candidates.len();
+        candidates
+    }
 
-        let mut prefiltered_candidates = Vec::new();
-        for candidate in candidates {
-            match prefilter_candidate(&candidate) {
+    fn enrich_steam_candidates_from_steamdb(
+        &self,
+        steam_candidates: &mut [SteamCandidate],
+        steamdb_entries: &[SteamDbPromotionEntry],
+    ) {
+        let steamdb_map = steamdb_entries
+            .iter()
+            .map(|entry| (entry.appid, entry.to_candidate()))
+            .collect::<HashMap<_, _>>();
+
+        for candidate in steam_candidates {
+            if let Some(steamdb_candidate) = steamdb_map.get(&candidate.appid) {
+                candidate.merge_from(steamdb_candidate.clone());
+            }
+        }
+    }
+
+    async fn process_steam_prefiltered_candidates(
+        &self,
+        summary: &mut CheckSummary,
+        target_chat_ids: &[String],
+        active_map: &HashMap<i64, PriceEventRecord>,
+        steam_candidates: &[SteamCandidate],
+        appdetails_cache: &mut HashMap<i64, AppDetailsResult>,
+    ) {
+        let mut passed_candidates = Vec::new();
+
+        for candidate in steam_candidates {
+            match prefilter_candidate(candidate) {
                 CandidatePrefilterDecision::Passed => {
-                    summary.passed_prefilter += 1;
-                    prefiltered_candidates.push(candidate);
+                    summary.steam_prefilter_passed += 1;
+                    passed_candidates.push(candidate.clone());
                 }
                 CandidatePrefilterDecision::MissingPriceData => {
-                    summary.missing_candidate_price_data += 1;
+                    summary.steam_missing_candidate_price_data += 1;
                 }
                 CandidatePrefilterDecision::Skipped => {
-                    summary.skipped_by_prefilter += 1;
+                    summary.steam_prefilter_skipped += 1;
                 }
             }
         }
 
-        for (index, candidate) in prefiltered_candidates.iter().enumerate() {
-            let appid = candidate.appid;
-            let appid_u32 = match u32::try_from(appid) {
-                Ok(appid_u32) => appid_u32,
-                Err(_) => {
-                    summary.errors += 1;
-                    warn!("Skipping invalid prefiltered appid: {appid}");
-                    continue;
-                }
-            };
-
-            summary.appdetails_requests += 1;
-
-            match self.steam.fetch_single_app_details_result(appid_u32).await {
-                Ok(AppDetailsResult::Available(details)) => {
-                    summary.app_details_fetched += 1;
-                    self.process_app_details(
-                        &mut summary,
-                        &target_chat_ids,
-                        &active_map,
-                        candidate,
-                        details.as_ref(),
-                    )
-                    .await;
-                }
-                Ok(AppDetailsResult::Unavailable) => {
-                    summary.app_details_unavailable += 1;
-                    summary.record_skip(PromotionSkipReason::AppDetailsUnavailable);
-                }
-                Ok(AppDetailsResult::RateLimited) => {
-                    summary.rate_limited += 1;
-                }
-                Err(error) => {
-                    summary.errors += 1;
-                    warn!("Steam appdetails request failed for app {appid}: {error}");
-                }
+        for (index, candidate) in passed_candidates.iter().enumerate() {
+            if let Some(details_result) = self
+                .get_or_fetch_app_details(summary, appdetails_cache, candidate.appid)
+                .await
+            {
+                self.process_details_result(
+                    summary,
+                    target_chat_ids,
+                    active_map,
+                    candidate,
+                    details_result,
+                )
+                .await;
             }
 
-            let has_more_requests = index + 1 < prefiltered_candidates.len();
-            if has_more_requests {
+            if index + 1 < passed_candidates.len() {
                 time::sleep(Duration::from_millis(APPDETAILS_REQUEST_DELAY_MS)).await;
             }
         }
+    }
 
+    async fn process_steamdb_candidates(
+        &self,
+        summary: &mut CheckSummary,
+        target_chat_ids: &[String],
+        active_map: &HashMap<i64, PriceEventRecord>,
+        steamdb_entries: &[SteamDbPromotionEntry],
+        appdetails_cache: &mut HashMap<i64, AppDetailsResult>,
+    ) {
         info!(
-            reason = %summary.reason,
-            target_chats = summary.target_chats,
-            candidate_app_ids = summary.candidate_app_ids,
-            passed_prefilter = summary.passed_prefilter,
-            skipped_by_prefilter = summary.skipped_by_prefilter,
-            missing_candidate_price_data = summary.missing_candidate_price_data,
-            appdetails_requests = summary.appdetails_requests,
-            app_details_fetched = summary.app_details_fetched,
-            app_details_unavailable = summary.app_details_unavailable,
-            rate_limited = summary.rate_limited,
-            skipped_apps = summary.skipped_apps,
-            valid_free_promotions = summary.valid_free_promotions,
-            posts_attempted = summary.posts_attempted,
-            posts_successfully_sent = summary.posts_successfully_sent,
-            duplicate_posts_skipped = summary.duplicate_posts_skipped,
-            errors = summary.errors,
-            "Steam check finished"
+            accepted = steamdb_entries.len(),
+            "SteamDB candidates prepared for appdetails"
         );
 
-        Ok(summary)
+        for (index, entry) in steamdb_entries.iter().enumerate() {
+            let candidate = entry.to_candidate();
+            if let Some(details_result) = self
+                .get_or_fetch_app_details(summary, appdetails_cache, candidate.appid)
+                .await
+            {
+                self.process_details_result(
+                    summary,
+                    target_chat_ids,
+                    active_map,
+                    &candidate,
+                    details_result,
+                )
+                .await;
+            }
+
+            if index + 1 < steamdb_entries.len() {
+                time::sleep(Duration::from_millis(APPDETAILS_REQUEST_DELAY_MS)).await;
+            }
+        }
+    }
+
+    async fn get_or_fetch_app_details(
+        &self,
+        summary: &mut CheckSummary,
+        appdetails_cache: &mut HashMap<i64, AppDetailsResult>,
+        appid: i64,
+    ) -> Option<AppDetailsResult> {
+        if let Some(cached) = appdetails_cache.get(&appid) {
+            return Some(cached.clone());
+        }
+
+        let appid_u32 = match u32::try_from(appid) {
+            Ok(appid_u32) => appid_u32,
+            Err(_) => {
+                summary.errors += 1;
+                warn!("Skipping invalid appid for appdetails: {appid}");
+                return None;
+            }
+        };
+
+        summary.appdetails_requests += 1;
+
+        match self.steam.fetch_single_app_details_result(appid_u32).await {
+            Ok(result) => {
+                match &result {
+                    AppDetailsResult::Available(_) => {
+                        summary.app_details_fetched += 1;
+                    }
+                    AppDetailsResult::Unavailable => {
+                        summary.app_details_unavailable += 1;
+                    }
+                    AppDetailsResult::RateLimited => {
+                        summary.rate_limited += 1;
+                    }
+                }
+
+                appdetails_cache.insert(appid, result.clone());
+                Some(result)
+            }
+            Err(error) => {
+                summary.errors += 1;
+                warn!("Steam appdetails request failed for app {appid}: {error}");
+                None
+            }
+        }
+    }
+
+    async fn process_details_result(
+        &self,
+        summary: &mut CheckSummary,
+        target_chat_ids: &[String],
+        active_map: &HashMap<i64, PriceEventRecord>,
+        candidate: &SteamCandidate,
+        details_result: AppDetailsResult,
+    ) {
+        match details_result {
+            AppDetailsResult::Available(details) => {
+                self.process_app_details(
+                    summary,
+                    target_chat_ids,
+                    active_map,
+                    candidate,
+                    details.as_ref(),
+                )
+                .await;
+            }
+            AppDetailsResult::Unavailable => {
+                summary.record_skip(PromotionSkipReason::AppDetailsUnavailable);
+            }
+            AppDetailsResult::RateLimited => {}
+        }
     }
 
     async fn process_app_details(
@@ -290,7 +453,7 @@ impl CheckRunner {
             return;
         }
 
-        match self.steam.evaluate_free_promotion(details, Some(candidate)) {
+        match self.evaluate_candidate_promotion(candidate, details) {
             PromotionEvaluation::Publishable(mut promotion) => {
                 summary.valid_free_promotions += 1;
 
@@ -418,6 +581,34 @@ impl CheckRunner {
                     }
                 }
             }
+        }
+    }
+
+    fn evaluate_candidate_promotion(
+        &self,
+        candidate: &SteamCandidate,
+        details: &crate::steam::SteamAppData,
+    ) -> PromotionEvaluation {
+        let evaluation = self.steam.evaluate_free_promotion(details, Some(candidate));
+
+        match evaluation {
+            PromotionEvaluation::Skipped(PromotionSkipReason::MissingPriceOverview)
+                if candidate.source == STEAMDB_FREE_TO_KEEP_SOURCE_NAME
+                    && details.kind.as_deref() == Some("game")
+                    && !details.is_free.unwrap_or(false)
+                    && !looks_like_excluded_title(&details.name) =>
+            {
+                PromotionEvaluation::Publishable(FreePromotion {
+                    appid: details.steam_appid.unwrap_or(candidate.appid),
+                    currency: candidate.currency.clone(),
+                    regular_price_cents: None,
+                    final_price_cents: Some(0),
+                    discount_percent: Some(100),
+                    free_until: candidate.free_until,
+                    source: candidate.source.clone(),
+                })
+            }
+            _ => evaluation,
         }
     }
 }
