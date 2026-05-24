@@ -5,9 +5,10 @@ Rust Telegram bot that watches Steam for games that are normally paid but tempor
 ## What the bot does
 
 - Checks Steam on a schedule.
-- Uses two best-effort sources for promotions:
+- Uses multiple best-effort Steam sources for promotions:
   - Steam Store `featuredcategories`
-  - SteamDB Free Promotions page for `Free to Keep`
+  - Steam Store Search free specials
+  - optional SteamDB Free Promotions debug source
 - Publishes only promotions that match all business rules:
   - regular/original price `> 0`
   - current/final price `== 0`
@@ -59,6 +60,7 @@ These commands are not shown in the public command menu. They can still be used 
 - `/status`
 - `/check_now`
 - `/debug_steam_http`
+- `/debug_store_search`
 - `/debug_steamdb`
 - `/test_post`
 - `/preview_app <appid>`
@@ -111,7 +113,10 @@ Fill in the values you need:
 | `DEEPSEEK_MODEL` | DeepSeek model name, default `deepseek-v4-flash` |
 | `STEAM_COUNTRY` | Steam country code, default `DE` |
 | `STEAM_LANGUAGE` | Steam language, default `russian` |
-| `ENABLE_STEAMDB_SOURCE` | Enable or disable the SteamDB Free Promotions source |
+| `ENABLE_STEAM_STORE_SEARCH_SOURCE` | Enable or disable the Steam Store Search source |
+| `STEAM_STORE_SEARCH_COUNT` | Number of search rows requested from Steam Store Search |
+| `STEAM_STORE_SEARCH_URL` | Steam Store Search endpoint URL |
+| `ENABLE_STEAMDB_SOURCE` | Enable or disable the optional SteamDB source, default `false` |
 | `STEAMDB_FREE_PROMOTIONS_URL` | SteamDB Free Promotions page URL |
 | `STEAMDB_USER_AGENT` | User-Agent used for SteamDB requests |
 | `STEAMDB_TIMEOUT_SECONDS` | HTTP timeout for SteamDB page fetch |
@@ -155,7 +160,7 @@ On startup the bot will:
 
 - The bot keeps Telegram polling alive even if a Steam check fails.
 - Steam checks are guarded so one failed promotion does not stop the whole run.
-- If SteamDB fails or returns a challenge page, the bot logs it and continues with Steam Store data.
+- If Steam Store Search or SteamDB fails, the bot logs it and continues with the other enabled sources.
 - DeepSeek failures fall back to Steam short descriptions instead of crashing the check.
 - If Telegram photo sending fails, the bot falls back to a text message.
 
@@ -167,7 +172,7 @@ On startup the bot will:
   - all chats with `enabled = true`
   - plus `TELEGRAM_MAIN_CHANNEL_ID` if configured
 - Duplicate posts are prevented per chat and per active price event.
-- SteamDB promotions are deduplicated by app ID and active promotion end time through the existing `price_events` / `published_posts` pipeline.
+- Promotions from different sources are deduplicated through the existing `price_events` / `published_posts` pipeline.
 
 ## Sources
 
@@ -176,13 +181,21 @@ On startup the bot will:
 - The bot uses Steam `featuredcategories` as source #1.
 - Candidate price data is prefiltered before calling `appdetails`.
 
+### Steam Store Search
+
+- The bot uses Steam Store Search free specials as source #2.
+- It parses `results_html` from the official Steam Store search endpoint.
+- Only rows that already look like paid games with a 100% discount and final price `0` are sent to `appdetails`.
+- This source helps catch some free-to-keep promotions that are missing from `featuredcategories`.
+
 ### SteamDB Free Promotions
 
-- The bot uses [SteamDB Free Promotions](https://steamdb.info/upcoming/free/) as source #2.
+- The bot can optionally use [SteamDB Free Promotions](https://steamdb.info/upcoming/free/) as an extra best-effort source.
 - Only `Free to Keep` entries are accepted.
 - `Play For Free` entries are skipped.
 - SteamDB entries still go through Steam `appdetails` validation before publishing.
 - If Steam price data is missing but SteamDB marks the promotion as `Free to Keep`, the bot may still publish it when `appdetails` confirms the app is a real game and not free-to-play.
+- SteamDB is disabled by default because some VPS environments receive `403 Forbidden`.
 
 ## Steam detection rules
 
@@ -293,6 +306,7 @@ sudo journalctl -u steam-free-games-bot -f
 - Admin `/test_post`
 - Admin `/check_now`
 - Admin `/debug_steam_http`
+- Admin `/debug_store_search`
 - Admin `/debug_steamdb`
 - Admin `/preview_app 570`
 
@@ -300,5 +314,5 @@ sudo journalctl -u steam-free-games-bot -f
 
 - Steam may not always provide the promotion end date, so the bot will honestly say when Steam did not provide it.
 - Steam Store endpoints are inconsistent, so candidate discovery and free-until detection are best-effort.
-- SteamDB can change its HTML or return a browser challenge page, so SteamDB parsing is also best-effort.
+- SteamDB can return `403 Forbidden`, a browser challenge page, or changed HTML, so SteamDB parsing is strictly best-effort and optional.
 - The project uses long polling and SQLite, which is appropriate for a single-instance MVP but not for horizontal scaling.

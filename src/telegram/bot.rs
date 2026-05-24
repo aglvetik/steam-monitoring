@@ -19,7 +19,7 @@ use crate::{
     scheduler::{CheckRunner, CheckSummary},
     steam::{
         FreePromotion, PromotionEvaluation, PromotionSkipReason, SteamClient,
-        SteamDbFreePromotionsReport, SteamGameData, SteamHttpDebugReport,
+        SteamDbFreePromotionsReport, SteamGameData, SteamHttpDebugReport, SteamStoreSearchReport,
     },
     utils::{html::truncate_chars, time::format_berlin_datetime},
 };
@@ -119,6 +119,9 @@ async fn handle_command(
         TelegramCommand::Status => handle_status(bot, msg, repo, config).await,
         TelegramCommand::CheckNow => handle_check_now(bot, msg, config, check_runner).await,
         TelegramCommand::DebugSteamHttp => handle_debug_steam_http(bot, msg, config, steam).await,
+        TelegramCommand::DebugStoreSearch => {
+            handle_debug_store_search(bot, msg, config, steam).await
+        }
         TelegramCommand::DebugSteamDb => handle_debug_steamdb(bot, msg, config, steam).await,
         TelegramCommand::TestPost => handle_test_post(bot, msg, repo, config).await,
         TelegramCommand::PreviewApp { appid } => {
@@ -338,6 +341,38 @@ async fn handle_debug_steamdb(
     Ok(())
 }
 
+async fn handle_debug_store_search(
+    bot: &Bot,
+    msg: &Message,
+    config: &Config,
+    steam: &SteamClient,
+) -> AppResult<()> {
+    if !ensure_admin(bot, msg, config).await? {
+        return Ok(());
+    }
+
+    if !msg.chat.is_private() {
+        send_admin_reply(
+            bot,
+            msg.chat.id,
+            "Выполните /debug_store_search в личном чате с ботом.",
+            "Failed to send /debug_store_search private-chat hint",
+        )
+        .await;
+        return Ok(());
+    }
+
+    let report = steam.debug_store_search_free_specials().await;
+    send_admin_reply(
+        bot,
+        msg.chat.id,
+        format_store_search_debug_report(&report),
+        "Failed to send /debug_store_search reply",
+    )
+    .await;
+    Ok(())
+}
+
 async fn handle_test_post(
     bot: &Bot,
     msg: &Message,
@@ -541,6 +576,26 @@ fn format_check_summary(summary: &CheckSummary) -> String {
             "Steam без данных цены: {}",
             summary.steam_missing_candidate_price_data
         ),
+        format!(
+            "Steam Store Search entries parsed: {}",
+            summary.steam_search_entries_parsed
+        ),
+        format!(
+            "Steam Store Search 100% free candidates: {}",
+            summary.steam_search_free_candidates
+        ),
+        format!(
+            "Steam Store Search skipped: {}",
+            summary.steam_search_skipped
+        ),
+        format!(
+            "Steam Store Search missing appid: {}",
+            summary.steam_search_missing_appid
+        ),
+        format!(
+            "Steam Store Search missing price data: {}",
+            summary.steam_search_missing_price_data
+        ),
         format!("SteamDB entries parsed: {}", summary.steamdb_entries_parsed),
         format!("SteamDB Free to Keep: {}", summary.steamdb_free_to_keep),
         format!("Запросов appdetails: {}", summary.appdetails_requests),
@@ -565,8 +620,22 @@ fn format_check_summary(summary: &CheckSummary) -> String {
         lines.push(format!("Ограничение Steam / 429: {}", summary.rate_limited));
     }
 
-    if summary.steamdb_source_error.is_some() {
-        lines.push("SteamDB: ошибка загрузки, источник пропущен.".to_string());
+    if let Some(error) = summary.steam_search_source_error.as_deref() {
+        if error.contains("disabled by config") {
+            lines.push("Steam Store Search: disabled".to_string());
+        } else {
+            lines.push("Steam Store Search: ошибка загрузки, источник пропущен.".to_string());
+        }
+    }
+
+    if let Some(error) = summary.steamdb_source_error.as_deref() {
+        if error.contains("disabled by config") {
+            lines.push("SteamDB: disabled".to_string());
+        } else if summary.steamdb_http_status == Some(403) || error.contains("403") {
+            lines.push("SteamDB: 403 Forbidden, source skipped".to_string());
+        } else {
+            lines.push("SteamDB: ошибка загрузки, источник пропущен.".to_string());
+        }
     }
 
     if summary.steamdb_parse_errors > 0 {
@@ -612,9 +681,70 @@ fn format_check_summary(summary: &CheckSummary) -> String {
     lines.join("\n")
 }
 
+fn format_store_search_debug_report(report: &SteamStoreSearchReport) -> String {
+    let mut lines = vec![
+        format!("Steam Store Search endpoint: {}", report.url),
+        format!(
+            "HTTP status: {}",
+            report
+                .http_status
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "n/a".to_string())
+        ),
+        format!(
+            "Response bytes: {}",
+            report
+                .response_bytes
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "n/a".to_string())
+        ),
+        format!("Parsed entries: {}", report.parsed_entries),
+        format!(
+            "Accepted 100% free candidates: {}",
+            report.accepted_candidates
+        ),
+        format!("Skipped: {}", report.skipped_count),
+        format!("Missing appid: {}", report.missing_appid_skipped),
+        format!("Missing price data: {}", report.missing_price_data),
+    ];
+
+    if let Some(error) = report.error.as_deref() {
+        lines.push(format!("Error: {error}"));
+        if report.http_status == Some(403) || error.contains("403") {
+            lines.push("SteamDB заблокировал запрос с VPS, источник пропущен.".to_string());
+        }
+    }
+
+    if !report.accepted_entries.is_empty() {
+        lines.push(String::new());
+        lines.push("Accepted entries:".to_string());
+
+        for entry in report.accepted_entries.iter().take(10) {
+            lines.push(format!(
+                "- {} | {} | {} -> {} | {}% | {}",
+                entry.appid,
+                entry.name,
+                format_price(entry.regular_price_cents, entry.currency.as_deref()),
+                format_price(entry.final_price_cents, entry.currency.as_deref()),
+                entry.discount_percent,
+                entry.store_url
+            ));
+        }
+    }
+
+    lines.join("\n")
+}
+
 fn format_steamdb_debug_report(report: &SteamDbFreePromotionsReport) -> String {
     let mut lines = vec![
         format!("SteamDB URL: {}", report.url),
+        format!(
+            "HTTP status: {}",
+            report
+                .http_status
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "n/a".to_string())
+        ),
         format!("SteamDB entries parsed: {}", report.entries_parsed),
         format!("Free to Keep accepted: {}", report.free_to_keep_accepted),
         format!("Play For Free skipped: {}", report.play_for_free_skipped),

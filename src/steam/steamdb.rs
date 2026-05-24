@@ -38,6 +38,7 @@ impl SteamDbPromotionEntry {
 #[derive(Debug, Clone, Default)]
 pub struct SteamDbFreePromotionsReport {
     pub url: String,
+    pub http_status: Option<u16>,
     pub response_bytes: Option<usize>,
     pub entries_parsed: usize,
     pub free_to_keep_accepted: usize,
@@ -80,6 +81,7 @@ impl SteamDbFreePromotionsSource {
         };
 
         let status = response.status();
+        report.http_status = Some(status.as_u16());
         let html = match response.text().await {
             Ok(html) => html,
             Err(error) => {

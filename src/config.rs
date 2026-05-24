@@ -13,6 +13,9 @@ pub struct Config {
     pub deepseek_model: String,
     pub steam_country: String,
     pub steam_language: String,
+    pub enable_steam_store_search_source: bool,
+    pub steam_store_search_count: u32,
+    pub steam_store_search_url: String,
     pub enable_steamdb_source: bool,
     pub steamdb_free_promotions_url: String,
     pub steamdb_user_agent: String,
@@ -35,7 +38,7 @@ impl Config {
             env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
         let steam_country = env::var("STEAM_COUNTRY").unwrap_or_else(|_| "DE".to_string());
         let steam_language = env::var("STEAM_LANGUAGE").unwrap_or_else(|_| "russian".to_string());
-        let enable_steamdb_source = env::var("ENABLE_STEAMDB_SOURCE")
+        let enable_steam_store_search_source = env::var("ENABLE_STEAM_STORE_SEARCH_SOURCE")
             .ok()
             .map(|value| {
                 matches!(
@@ -44,6 +47,22 @@ impl Config {
                 )
             })
             .unwrap_or(true);
+        let steam_store_search_count = env::var("STEAM_STORE_SEARCH_COUNT")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(100);
+        let steam_store_search_url = env::var("STEAM_STORE_SEARCH_URL")
+            .unwrap_or_else(|_| "https://store.steampowered.com/search/results/".to_string());
+        let enable_steamdb_source = env::var("ENABLE_STEAMDB_SOURCE")
+            .ok()
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
         let steamdb_free_promotions_url = env::var("STEAMDB_FREE_PROMOTIONS_URL")
             .unwrap_or_else(|_| "https://steamdb.info/upcoming/free/".to_string());
         let steamdb_user_agent = env::var("STEAMDB_USER_AGENT")
@@ -79,6 +98,9 @@ impl Config {
             deepseek_model,
             steam_country,
             steam_language,
+            enable_steam_store_search_source,
+            steam_store_search_count,
+            steam_store_search_url,
             enable_steamdb_source,
             steamdb_free_promotions_url,
             steamdb_user_agent,

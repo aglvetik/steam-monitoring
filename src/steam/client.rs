@@ -13,6 +13,7 @@ use super::{
     models::SteamAppDetailsEnvelope,
     sources::FeaturedCategoriesSource,
     steamdb::{SteamDbFreePromotionsReport, SteamDbFreePromotionsSource},
+    store_search::{SteamStoreSearchFreeSpecialsSource, SteamStoreSearchReport},
     PromotionEvaluation, SteamAppData, SteamCandidate, SteamGameData,
 };
 
@@ -34,43 +35,56 @@ pub enum AppDetailsResult {
     RateLimited,
 }
 
+#[derive(Debug, Clone)]
+pub struct SteamClientConfig {
+    pub country: String,
+    pub language: String,
+    pub store_search_enabled: bool,
+    pub store_search_url: String,
+    pub store_search_count: u32,
+    pub steamdb_enabled: bool,
+    pub steamdb_url: String,
+    pub steamdb_user_agent: String,
+    pub steamdb_timeout_seconds: u64,
+}
+
 pub struct SteamClient {
     country: String,
     language: String,
     http: Client,
     featured_source: FeaturedCategoriesSource,
+    store_search_enabled: bool,
+    store_search_source: SteamStoreSearchFreeSpecialsSource,
     steamdb_enabled: bool,
     steamdb_http: Client,
     steamdb_source: SteamDbFreePromotionsSource,
 }
 
 impl SteamClient {
-    pub fn new(
-        country: String,
-        language: String,
-        steamdb_enabled: bool,
-        steamdb_url: String,
-        steamdb_user_agent: String,
-        steamdb_timeout_seconds: u64,
-    ) -> AppResult<Self> {
+    pub fn new(config: SteamClientConfig) -> AppResult<Self> {
         let http = Client::builder()
             .user_agent("steam-free-games-bot/0.1")
             .no_proxy()
             .build()?;
         let steamdb_http = Client::builder()
-            .user_agent(steamdb_user_agent)
+            .user_agent(config.steamdb_user_agent)
             .no_proxy()
-            .timeout(Duration::from_secs(steamdb_timeout_seconds.max(1)))
+            .timeout(Duration::from_secs(config.steamdb_timeout_seconds.max(1)))
             .build()?;
 
         Ok(Self {
-            country,
-            language,
+            country: config.country,
+            language: config.language,
             http,
             featured_source: FeaturedCategoriesSource,
-            steamdb_enabled,
+            store_search_enabled: config.store_search_enabled,
+            store_search_source: SteamStoreSearchFreeSpecialsSource::new(
+                config.store_search_url,
+                config.store_search_count,
+            ),
+            steamdb_enabled: config.steamdb_enabled,
             steamdb_http,
-            steamdb_source: SteamDbFreePromotionsSource::new(steamdb_url),
+            steamdb_source: SteamDbFreePromotionsSource::new(config.steamdb_url),
         })
     }
 
@@ -86,6 +100,20 @@ impl SteamClient {
         let mut values = self.featured_source.fetch(self).await?;
         values.sort_by_key(|item| item.appid);
         Ok(values)
+    }
+
+    pub async fn fetch_store_search_free_specials(&self) -> SteamStoreSearchReport {
+        if !self.store_search_enabled {
+            return SteamStoreSearchReport {
+                url: self.store_search_source.url(&self.country, &self.language),
+                error: Some("Steam Store Search source is disabled by config.".to_string()),
+                ..SteamStoreSearchReport::default()
+            };
+        }
+
+        self.store_search_source
+            .fetch(&self.http, &self.country, &self.language)
+            .await
     }
 
     pub async fn fetch_steamdb_free_promotions(&self) -> SteamDbFreePromotionsReport {
@@ -225,6 +253,10 @@ impl SteamClient {
 
     pub async fn debug_steamdb_free_promotions(&self) -> SteamDbFreePromotionsReport {
         self.fetch_steamdb_free_promotions().await
+    }
+
+    pub async fn debug_store_search_free_specials(&self) -> SteamStoreSearchReport {
+        self.fetch_store_search_free_specials().await
     }
 
     pub(crate) async fn get_json<T>(&self, url: &str) -> AppResult<T>

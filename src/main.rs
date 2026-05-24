@@ -39,14 +39,17 @@ async fn main() -> AppResult<()> {
             .await?;
     }
 
-    let steam_client = Arc::new(steam::SteamClient::new(
-        config.steam_country.clone(),
-        config.steam_language.clone(),
-        config.enable_steamdb_source,
-        config.steamdb_free_promotions_url.clone(),
-        config.steamdb_user_agent.clone(),
-        config.steamdb_timeout_seconds,
-    )?);
+    let steam_client = Arc::new(steam::SteamClient::new(steam::SteamClientConfig {
+        country: config.steam_country.clone(),
+        language: config.steam_language.clone(),
+        store_search_enabled: config.enable_steam_store_search_source,
+        store_search_url: config.steam_store_search_url.clone(),
+        store_search_count: config.steam_store_search_count,
+        steamdb_enabled: config.enable_steamdb_source,
+        steamdb_url: config.steamdb_free_promotions_url.clone(),
+        steamdb_user_agent: config.steamdb_user_agent.clone(),
+        steamdb_timeout_seconds: config.steamdb_timeout_seconds,
+    })?);
     let deepseek_client = Arc::new(deepseek::client::DeepSeekClient::new(
         config.deepseek_api_key.clone(),
         config.deepseek_model.clone(),

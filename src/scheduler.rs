@@ -14,7 +14,8 @@ use crate::{
     steam::{
         looks_like_excluded_title, prefilter_candidate, AppDetailsResult,
         CandidatePrefilterDecision, FreePromotion, PromotionEvaluation, PromotionSkipReason,
-        SteamCandidate, SteamClient, SteamDbPromotionEntry, STEAMDB_FREE_TO_KEEP_SOURCE_NAME,
+        SteamCandidate, SteamClient, SteamDbPromotionEntry, SteamStoreSearchEntry,
+        STEAMDB_FREE_TO_KEEP_SOURCE_NAME, STEAM_STORE_SEARCH_SOURCE_NAME,
     },
     telegram::{formatting::build_post, publisher::TelegramPublisher},
     utils::time::parse_rfc3339_utc,
@@ -30,12 +31,20 @@ pub struct CheckSummary {
     pub steam_prefilter_passed: usize,
     pub steam_prefilter_skipped: usize,
     pub steam_missing_candidate_price_data: usize,
+    pub steam_search_entries_parsed: usize,
+    pub steam_search_free_candidates: usize,
+    pub steam_search_skipped: usize,
+    pub steam_search_missing_appid: usize,
+    pub steam_search_missing_price_data: usize,
+    pub steam_search_http_status: Option<u16>,
+    pub steam_search_source_error: Option<String>,
     pub steamdb_entries_parsed: usize,
     pub steamdb_free_to_keep: usize,
     pub steamdb_play_for_free_skipped: usize,
     pub steamdb_missing_appid_skipped: usize,
     pub steamdb_expired_skipped: usize,
     pub steamdb_parse_errors: usize,
+    pub steamdb_http_status: Option<u16>,
     pub steamdb_source_error: Option<String>,
     pub appdetails_requests: usize,
     pub app_details_fetched: usize,
@@ -66,7 +75,10 @@ impl CheckSummary {
         if self.posts_successfully_sent > 0 {
             return None;
         }
-        if self.steam_request_failed && self.steamdb_source_error.is_some() {
+        if self.steam_request_failed
+            && self.steam_search_source_error.is_some()
+            && self.steamdb_source_error.is_some()
+        {
             return Some("не удалось получить данные из подключённых источников.");
         }
         if self.steam_request_failed {
@@ -171,7 +183,21 @@ impl CheckRunner {
 
         let mut steam_candidates = self.fetch_and_prepare_steam_candidates(&mut summary).await;
 
+        let store_search_report = self.steam.fetch_store_search_free_specials().await;
+        summary.steam_search_entries_parsed = store_search_report.parsed_entries;
+        summary.steam_search_free_candidates = store_search_report.accepted_candidates;
+        summary.steam_search_skipped = store_search_report.skipped_count;
+        summary.steam_search_missing_appid = store_search_report.missing_appid_skipped;
+        summary.steam_search_missing_price_data = store_search_report.missing_price_data;
+        summary.steam_search_http_status = store_search_report.http_status;
+        summary.steam_search_source_error = store_search_report.error.clone();
+
+        if let Some(error) = summary.steam_search_source_error.as_deref() {
+            warn!("Steam Store Search source skipped: {error}");
+        }
+
         let steamdb_report = self.steam.fetch_steamdb_free_promotions().await;
+        summary.steamdb_http_status = steamdb_report.http_status;
         summary.steamdb_entries_parsed = steamdb_report.entries_parsed;
         summary.steamdb_free_to_keep = steamdb_report.free_to_keep_accepted;
         summary.steamdb_play_for_free_skipped = steamdb_report.play_for_free_skipped;
@@ -200,6 +226,15 @@ impl CheckRunner {
         )
         .await;
 
+        self.process_store_search_candidates(
+            &mut summary,
+            &target_chat_ids,
+            &active_map,
+            &store_search_report.accepted_entries,
+            &mut appdetails_cache,
+        )
+        .await;
+
         self.process_steamdb_candidates(
             &mut summary,
             &target_chat_ids,
@@ -216,6 +251,8 @@ impl CheckRunner {
             steam_prefilter_passed = summary.steam_prefilter_passed,
             steam_prefilter_skipped = summary.steam_prefilter_skipped,
             steam_missing_candidate_price_data = summary.steam_missing_candidate_price_data,
+            steam_search_entries_parsed = summary.steam_search_entries_parsed,
+            steam_search_free_candidates = summary.steam_search_free_candidates,
             steamdb_entries_parsed = summary.steamdb_entries_parsed,
             steamdb_free_to_keep = summary.steamdb_free_to_keep,
             appdetails_requests = summary.appdetails_requests,
@@ -323,6 +360,41 @@ impl CheckRunner {
             }
 
             if index + 1 < passed_candidates.len() {
+                time::sleep(Duration::from_millis(APPDETAILS_REQUEST_DELAY_MS)).await;
+            }
+        }
+    }
+
+    async fn process_store_search_candidates(
+        &self,
+        summary: &mut CheckSummary,
+        target_chat_ids: &[String],
+        active_map: &HashMap<i64, PriceEventRecord>,
+        store_search_entries: &[SteamStoreSearchEntry],
+        appdetails_cache: &mut HashMap<i64, AppDetailsResult>,
+    ) {
+        info!(
+            accepted = store_search_entries.len(),
+            "Steam Store Search candidates prepared for appdetails"
+        );
+
+        for (index, entry) in store_search_entries.iter().enumerate() {
+            let candidate = entry.to_candidate();
+            if let Some(details_result) = self
+                .get_or_fetch_app_details(summary, appdetails_cache, candidate.appid)
+                .await
+            {
+                self.process_details_result(
+                    summary,
+                    target_chat_ids,
+                    active_map,
+                    &candidate,
+                    details_result,
+                )
+                .await;
+            }
+
+            if index + 1 < store_search_entries.len() {
                 time::sleep(Duration::from_millis(APPDETAILS_REQUEST_DELAY_MS)).await;
             }
         }
@@ -604,6 +676,25 @@ impl CheckRunner {
                     regular_price_cents: None,
                     final_price_cents: Some(0),
                     discount_percent: Some(100),
+                    free_until: candidate.free_until,
+                    source: candidate.source.clone(),
+                })
+            }
+            PromotionEvaluation::Skipped(PromotionSkipReason::MissingPriceOverview)
+                if candidate.source == STEAM_STORE_SEARCH_SOURCE_NAME
+                    && details.kind.as_deref() == Some("game")
+                    && !details.is_free.unwrap_or(false)
+                    && !looks_like_excluded_title(&details.name)
+                    && candidate.regular_price_cents.unwrap_or_default() > 0
+                    && candidate.final_price_cents == Some(0)
+                    && candidate.discount_percent.unwrap_or_default() == 100 =>
+            {
+                PromotionEvaluation::Publishable(FreePromotion {
+                    appid: details.steam_appid.unwrap_or(candidate.appid),
+                    currency: candidate.currency.clone(),
+                    regular_price_cents: candidate.regular_price_cents,
+                    final_price_cents: candidate.final_price_cents,
+                    discount_percent: candidate.discount_percent,
                     free_until: candidate.free_until,
                     source: candidate.source.clone(),
                 })
