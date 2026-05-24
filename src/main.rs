@@ -65,6 +65,8 @@ async fn main() -> AppResult<()> {
         deepseek_client,
         publisher,
         config.telegram_main_channel_id.clone(),
+        config.steam_appdetails_batch_size,
+        config.steam_appdetails_batch_delay_ms,
     ));
     spawn_scheduler(
         check_runner.clone(),

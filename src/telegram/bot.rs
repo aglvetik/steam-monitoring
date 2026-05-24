@@ -5,7 +5,7 @@ use chrono_tz::Europe::Berlin;
 use teloxide::{
     payloads::GetUpdatesSetters,
     prelude::{Request, Requester},
-    types::{Message, Update, UpdateKind},
+    types::{ChatId, Message, Update, UpdateKind},
     Bot,
 };
 use tokio::time::sleep;
@@ -17,7 +17,11 @@ use crate::{
     deepseek::AiDescription,
     error::AppResult,
     scheduler::{CheckRunner, CheckSummary},
-    steam::{FreePromotion, PromotionEvaluation, SteamClient, SteamGameData, SteamHttpDebugReport},
+    steam::{
+        FreePromotion, PromotionEvaluation, PromotionSkipReason, SteamClient, SteamGameData,
+        SteamHttpDebugReport,
+    },
+    utils::html::truncate_chars,
 };
 
 use super::{
@@ -218,7 +222,7 @@ async fn handle_status(
         config.steam_language,
     );
 
-    bot.send_message(msg.chat.id, reply).await?;
+    send_admin_reply(bot, msg.chat.id, reply, "Failed to send /status reply").await;
     Ok(())
 }
 
@@ -244,19 +248,25 @@ async fn handle_check_now(
         .await
     {
         Ok(summary) => {
-            bot.send_message(msg.chat.id, format_check_summary(&summary))
-                .await?;
+            let reply = format_check_summary(&summary);
+            if let Err(error) = send_message_with_retry(bot, msg.chat.id, &reply).await {
+                warn!("Steam check completed, but failed to send Telegram summary: {error}");
+            }
         }
         Err(error) => {
-            bot.send_message(
+            error!("Manual Steam check failed: {error}");
+            send_admin_reply(
+                bot,
                 msg.chat.id,
                 format!(
                     "Проверка Steam завершилась с ошибкой.\n\
-                     Вероятная причина: Steam request failed\n\
-                     Ошибка: {error}"
+                     Вероятная причина: не удалось получить данные Steam.\n\
+                     Ошибка: {}",
+                    short_error_message(&error.to_string())
                 ),
+                "Failed to send /check_now error reply",
             )
-            .await?;
+            .await;
         }
     }
 
@@ -274,17 +284,24 @@ async fn handle_debug_steam_http(
     }
 
     if !msg.chat.is_private() {
-        bot.send_message(
+        send_admin_reply(
+            bot,
             msg.chat.id,
             "Выполните /debug_steam_http в личном чате с ботом.",
+            "Failed to send /debug_steam_http private-chat hint",
         )
-        .await?;
+        .await;
         return Ok(());
     }
 
     let report = steam.debug_featured_categories_http().await;
-    bot.send_message(msg.chat.id, format_debug_report(&report))
-        .await?;
+    send_admin_reply(
+        bot,
+        msg.chat.id,
+        format_debug_report(&report),
+        "Failed to send /debug_steam_http reply",
+    )
+    .await;
     Ok(())
 }
 
@@ -328,7 +345,7 @@ async fn handle_test_post(
         success_count,
         failed_count
     );
-    bot.send_message(msg.chat.id, summary).await?;
+    send_admin_reply(bot, msg.chat.id, summary, "Failed to send /test_post reply").await;
     Ok(())
 }
 
@@ -344,30 +361,64 @@ async fn handle_preview_app(
     }
 
     let Some(appid_arg) = appid_arg else {
-        bot.send_message(msg.chat.id, "Использование: /preview_app <appid>")
-            .await?;
+        send_admin_reply(
+            bot,
+            msg.chat.id,
+            "Использование: /preview_app <appid>",
+            "Failed to send /preview_app usage reply",
+        )
+        .await;
         return Ok(());
     };
 
     let Ok(appid) = appid_arg.trim().parse::<i64>() else {
-        bot.send_message(msg.chat.id, "App ID должен быть положительным числом.")
-            .await?;
+        send_admin_reply(
+            bot,
+            msg.chat.id,
+            "App ID должен быть положительным числом.",
+            "Failed to send /preview_app validation reply",
+        )
+        .await;
         return Ok(());
     };
 
     if appid <= 0 {
-        bot.send_message(msg.chat.id, "App ID должен быть положительным числом.")
-            .await?;
+        send_admin_reply(
+            bot,
+            msg.chat.id,
+            "App ID должен быть положительным числом.",
+            "Failed to send /preview_app validation reply",
+        )
+        .await;
         return Ok(());
     }
 
-    let Some(details) = steam.fetch_app_details(appid).await? else {
-        bot.send_message(
-            msg.chat.id,
-            format!("Steam не вернул данные для appid {appid}."),
-        )
-        .await?;
-        return Ok(());
+    let details = match steam.fetch_app_details(appid).await {
+        Ok(Some(details)) => details,
+        Ok(None) => {
+            send_admin_reply(
+                bot,
+                msg.chat.id,
+                "Steam не вернул данные для этого appid или приложение недоступно в выбранном регионе.",
+                "Failed to send /preview_app unavailable reply",
+            )
+            .await;
+            return Ok(());
+        }
+        Err(error) => {
+            error!("Steam preview fetch failed for app {appid}: {error}");
+            send_admin_reply(
+                bot,
+                msg.chat.id,
+                format!(
+                    "Не удалось получить данные Steam: {}",
+                    short_error_message(&error.to_string())
+                ),
+                "Failed to send /preview_app error reply",
+            )
+            .await;
+            return Ok(());
+        }
     };
 
     let game = steam.build_game_data(&details, None);
@@ -376,63 +427,61 @@ async fn handle_preview_app(
 
     let initial_price = price
         .map(|value| format_price(value.initial, Some(&value.currency)))
-        .unwrap_or_else(|| "n/a".to_string());
+        .unwrap_or_else(|| "нет данных".to_string());
     let final_price = price
         .map(|value| format_price(value.r#final, Some(&value.currency)))
-        .unwrap_or_else(|| "n/a".to_string());
+        .unwrap_or_else(|| "нет данных".to_string());
     let discount_percent = price
-        .map(|value| value.discount_percent.to_string())
-        .unwrap_or_else(|| "n/a".to_string());
+        .map(|value| format!("{}%", value.discount_percent))
+        .unwrap_or_else(|| "нет данных".to_string());
 
     let reply = match evaluation {
         PromotionEvaluation::Publishable(promotion) => format!(
-            "Preview app\n\
-             appid: {appid}\n\
-             name: {}\n\
-             app type: {}\n\
-             is_free_to_play: {}\n\
-             initial price: {}\n\
-             final price: {}\n\
-             discount percent: {}\n\
-             free until: {}\n\
-             Steam URL: {}\n\
-             result: would be published",
+            "🔎 Предпросмотр Steam App\n\n\
+             AppID: {appid}\n\
+             Название: {}\n\
+             Тип: {}\n\
+             Free-to-play: {}\n\
+             Обычная цена: {}\n\
+             Текущая цена: {}\n\
+             Скидка: {}\n\
+             Бесплатно до: {}\n\
+             Steam URL: {}\n\n\
+             Результат: будет опубликовано",
             game.name,
             game.kind.as_deref().unwrap_or("unknown"),
-            game.is_free_to_play,
+            bool_ru(game.is_free_to_play),
             initial_price,
             final_price,
             discount_percent,
             promotion
                 .free_until
                 .map(|value| value.to_rfc3339())
-                .unwrap_or_else(|| "unknown".to_string()),
+                .unwrap_or_else(|| "Steam не указал".to_string()),
             game.steam_url,
         ),
         PromotionEvaluation::Skipped(reason) => format!(
-            "Preview app\n\
-             appid: {appid}\n\
-             name: {}\n\
-             app type: {}\n\
-             is_free_to_play: {}\n\
-             initial price: {}\n\
-             final price: {}\n\
-             discount percent: {}\n\
-             Steam URL: {}\n\
-             skip reason: {}\n\
-             result: would NOT be published",
+            "🔎 Предпросмотр Steam App\n\n\
+             AppID: {appid}\n\
+             Название: {}\n\
+             Тип: {}\n\
+             Free-to-play: {}\n\
+             Обычная цена: {}\n\
+             Текущая цена: {}\n\
+             Скидка: {}\n\n\
+             Результат: не будет опубликовано\n\
+             Причина: {}",
             game.name,
             game.kind.as_deref().unwrap_or("unknown"),
-            game.is_free_to_play,
+            bool_ru(game.is_free_to_play),
             initial_price,
             final_price,
             discount_percent,
-            game.steam_url,
-            reason.as_str(),
+            reason.preview_reason_ru(),
         ),
     };
 
-    bot.send_message(msg.chat.id, reply).await?;
+    send_admin_reply(bot, msg.chat.id, reply, "Failed to send /preview_app reply").await;
     Ok(())
 }
 
@@ -447,30 +496,57 @@ async fn ensure_admin(bot: &Bot, msg: &Message, config: &Config) -> AppResult<bo
 }
 
 fn format_check_summary(summary: &CheckSummary) -> String {
-    let mut reply = format!(
-        "Проверка Steam завершена.\n\
-         Кандидатов от Steam: {}\n\
-         Получено деталей приложений: {}\n\
-         Валидных акций: {}\n\
-         Попыток публикации: {}\n\
-         Успешно отправлено: {}\n\
-         Дубликатов пропущено: {}\n\
-         Ошибок: {}",
-        summary.candidate_app_ids,
-        summary.app_details_fetched,
-        summary.valid_free_promotions,
-        summary.posts_attempted,
-        summary.posts_successfully_sent,
-        summary.duplicate_posts_skipped,
-        summary.errors
-    );
+    let mut lines = vec![
+        "Проверка Steam завершена.".to_string(),
+        format!("Кандидатов от Steam: {}", summary.candidate_app_ids),
+        format!("Детали получены: {}", summary.app_details_fetched),
+        format!(
+            "Данные Steam недоступны: {}",
+            summary.app_details_unavailable
+        ),
+        format!("Ограничение Steam / 429: {}", summary.rate_limited),
+        format!("Пропущено: {}", summary.skipped_apps),
+        format!("Валидных акций: {}", summary.valid_free_promotions),
+        format!("Попыток публикации: {}", summary.posts_attempted),
+        format!("Успешно отправлено: {}", summary.posts_successfully_sent),
+        format!("Дубликатов пропущено: {}", summary.duplicate_posts_skipped),
+        format!("Ошибок: {}", summary.errors),
+    ];
 
-    if let Some(reason) = summary.likely_reason() {
-        reply.push_str("\nВероятная причина: ");
-        reply.push_str(reason);
+    if !summary.skip_breakdown.is_empty() {
+        let mut breakdown = summary
+            .skip_breakdown
+            .iter()
+            .filter(|(reason, count)| {
+                **count > 0 && !matches!(reason, PromotionSkipReason::AppDetailsUnavailable)
+            })
+            .map(|(reason, count)| (reason.breakdown_label_ru(), *count))
+            .collect::<Vec<_>>();
+        breakdown.sort_by(|left, right| left.0.cmp(right.0));
+
+        if !breakdown.is_empty() {
+            lines.push(String::new());
+            lines.push("Причины пропуска:".to_string());
+            for (label, count) in breakdown {
+                lines.push(format!("- {label}: {count}"));
+            }
+        }
     }
 
-    reply
+    if let Some(reason) = summary.likely_reason_ru() {
+        lines.push(String::new());
+        lines.push(format!("Вероятная причина: {reason}"));
+    }
+
+    if summary.rate_limited > 0 {
+        lines.push(String::new());
+        lines.push(
+            "Steam временно ограничил часть запросов. Следующая проверка попробует снова."
+                .to_string(),
+        );
+    }
+
+    lines.join("\n")
 }
 
 fn format_debug_report(report: &SteamHttpDebugReport) -> String {
@@ -544,6 +620,55 @@ fn build_test_post() -> super::formatting::FormattedPost {
     };
 
     build_post(&game, &promotion, &ai)
+}
+
+fn short_error_message(error: &str) -> String {
+    truncate_chars(error.trim(), 180)
+}
+
+async fn send_admin_reply(bot: &Bot, chat_id: ChatId, text: impl Into<String>, context: &str) {
+    let text = text.into();
+    if let Err(error) = send_message_with_retry(bot, chat_id, &text).await {
+        warn!("{context}: {error}");
+    }
+}
+
+async fn send_message_with_retry(bot: &Bot, chat_id: ChatId, text: &str) -> AppResult<()> {
+    let retry_delays = [
+        Duration::from_secs(1),
+        Duration::from_secs(3),
+        Duration::from_secs(7),
+    ];
+    let mut last_error = None;
+
+    for attempt in 0..=retry_delays.len() {
+        match bot.send_message(chat_id, text.to_string()).await {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                warn!(
+                    attempt = attempt + 1,
+                    "Telegram reply send attempt failed: {error}"
+                );
+                last_error = Some(error);
+
+                if let Some(delay) = retry_delays.get(attempt) {
+                    sleep(*delay).await;
+                }
+            }
+        }
+    }
+
+    Err(last_error.map(Into::into).unwrap_or_else(|| {
+        crate::error::AppError::Other("failed to send Telegram reply".to_string())
+    }))
+}
+
+fn bool_ru(value: bool) -> &'static str {
+    if value {
+        "да"
+    } else {
+        "нет"
+    }
 }
 
 fn test_free_until_tomorrow_berlin() -> chrono::DateTime<Utc> {

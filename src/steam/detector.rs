@@ -16,25 +16,44 @@ const SKIP_TYPES: &[&str] = &[
     "video",
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PromotionSkipReason {
-    MissingPriceData,
-    AppIsFreeToPlay,
-    AppTypeIsNotGame,
-    DiscountIsNot100,
-    FinalPriceIsNot0,
-    InitialPriceIsNotGreaterThan0,
+    AppDetailsUnavailable,
+    UnsupportedAppType,
+    FreeToPlay,
+    MissingPriceOverview,
+    InitialPriceNotPositive,
+    FinalPriceNotZero,
+    DiscountNot100,
+    MissingRequiredFields,
 }
 
 impl PromotionSkipReason {
-    pub fn as_str(&self) -> &'static str {
+    pub fn preview_reason_ru(&self) -> &'static str {
         match self {
-            Self::MissingPriceData => "missing price data",
-            Self::AppIsFreeToPlay => "app is free-to-play",
-            Self::AppTypeIsNotGame => "app type is not game",
-            Self::DiscountIsNot100 => "discount is not 100%",
-            Self::FinalPriceIsNot0 => "final price is not 0",
-            Self::InitialPriceIsNotGreaterThan0 => "initial price is not greater than 0",
+            Self::AppDetailsUnavailable => {
+                "Steam не вернул данные для этого appid или приложение недоступно в выбранном регионе."
+            }
+            Self::UnsupportedAppType => "тип приложения не подходит для публикации.",
+            Self::FreeToPlay => "игра уже free-to-play.",
+            Self::MissingPriceOverview => "Steam не вернул данные о цене.",
+            Self::InitialPriceNotPositive => "обычная цена отсутствует или не больше нуля.",
+            Self::FinalPriceNotZero => "текущая цена не равна 0.",
+            Self::DiscountNot100 => "скидка не равна 100%.",
+            Self::MissingRequiredFields => "в данных Steam не хватает обязательных полей.",
+        }
+    }
+
+    pub fn breakdown_label_ru(&self) -> &'static str {
+        match self {
+            Self::AppDetailsUnavailable => "данные приложения недоступны",
+            Self::UnsupportedAppType => "не игра/DLC/demo/software",
+            Self::FreeToPlay => "уже free-to-play",
+            Self::MissingPriceOverview => "нет данных цены",
+            Self::InitialPriceNotPositive => "обычная цена не больше 0",
+            Self::FinalPriceNotZero => "текущая цена не равна 0",
+            Self::DiscountNot100 => "скидка не 100%",
+            Self::MissingRequiredFields => "другое",
         }
     }
 }
@@ -49,27 +68,32 @@ pub fn evaluate_free_promotion(
     details: &SteamAppData,
     candidate: Option<&SteamCandidate>,
 ) -> PromotionEvaluation {
-    if !is_game_type(details.kind.as_deref()) {
-        return PromotionEvaluation::Skipped(PromotionSkipReason::AppTypeIsNotGame);
+    if details.name.trim().is_empty() {
+        return PromotionEvaluation::Skipped(PromotionSkipReason::MissingRequiredFields);
+    }
+
+    if !is_supported_game_type(details.kind.as_deref()) {
+        return PromotionEvaluation::Skipped(PromotionSkipReason::UnsupportedAppType);
+    }
+
+    if is_free_to_play(details) {
+        return PromotionEvaluation::Skipped(PromotionSkipReason::FreeToPlay);
     }
 
     let Some(price) = details.price_overview.as_ref() else {
-        return PromotionEvaluation::Skipped(PromotionSkipReason::MissingPriceData);
+        return PromotionEvaluation::Skipped(PromotionSkipReason::MissingPriceOverview);
     };
 
     if price.initial <= 0 {
-        if details.is_free.unwrap_or(false) {
-            return PromotionEvaluation::Skipped(PromotionSkipReason::AppIsFreeToPlay);
-        }
-        return PromotionEvaluation::Skipped(PromotionSkipReason::InitialPriceIsNotGreaterThan0);
+        return PromotionEvaluation::Skipped(PromotionSkipReason::InitialPriceNotPositive);
     }
 
     if price.r#final != 0 {
-        return PromotionEvaluation::Skipped(PromotionSkipReason::FinalPriceIsNot0);
+        return PromotionEvaluation::Skipped(PromotionSkipReason::FinalPriceNotZero);
     }
 
     if price.discount_percent != 100 {
-        return PromotionEvaluation::Skipped(PromotionSkipReason::DiscountIsNot100);
+        return PromotionEvaluation::Skipped(PromotionSkipReason::DiscountNot100);
     }
 
     PromotionEvaluation::Publishable(FreePromotion {
@@ -85,16 +109,6 @@ pub fn evaluate_free_promotion(
             .map(|item| item.source.clone())
             .unwrap_or_else(|| "steam_appdetails".to_string()),
     })
-}
-
-pub fn detect_free_promotion(
-    details: &SteamAppData,
-    candidate: Option<&SteamCandidate>,
-) -> Option<FreePromotion> {
-    match evaluate_free_promotion(details, candidate) {
-        PromotionEvaluation::Publishable(promotion) => Some(promotion),
-        PromotionEvaluation::Skipped(_) => None,
-    }
 }
 
 pub fn build_game_data(
@@ -157,11 +171,21 @@ pub fn build_game_data(
     }
 }
 
-fn is_game_type(kind: Option<&str>) -> bool {
+fn is_supported_game_type(kind: Option<&str>) -> bool {
     let Some(kind) = kind else {
         return true;
     };
 
     let normalized = kind.trim().to_ascii_lowercase();
     normalized == "game" && !SKIP_TYPES.contains(&normalized.as_str())
+}
+
+fn is_free_to_play(details: &SteamAppData) -> bool {
+    let initial_price = details
+        .price_overview
+        .as_ref()
+        .map(|price| price.initial)
+        .unwrap_or_default();
+
+    details.is_free.unwrap_or(false) && initial_price <= 0
 }

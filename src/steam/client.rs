@@ -1,17 +1,17 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tracing::{debug, error};
+use tokio::time::sleep;
+use tracing::{debug, error, warn};
 
 use crate::error::{AppError, AppResult};
 
 use super::{
     detector,
-    models::SteamAppDetailsEnvelope,
     sources::{FeaturedCategoriesSource, SearchSpecialsSource},
-    FreePromotion, PromotionEvaluation, SteamAppData, SteamCandidate, SteamGameData,
+    PromotionEvaluation, SteamAppData, SteamCandidate, SteamGameData,
 };
 
 #[derive(Debug, Clone)]
@@ -23,6 +23,13 @@ pub struct SteamHttpDebugReport {
     pub candidate_app_ids: Option<usize>,
     pub stage: &'static str,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum AppDetailsResult {
+    Available(Box<SteamAppData>),
+    Unavailable,
+    RateLimited,
 }
 
 pub struct SteamClient {
@@ -113,26 +120,83 @@ impl SteamClient {
     }
 
     pub async fn fetch_app_details(&self, appid: i64) -> AppResult<Option<SteamAppData>> {
-        let url = format!(
-            "https://store.steampowered.com/api/appdetails?appids={appid}&cc={}&l={}",
-            self.country, self.language
-        );
-        let payload = self
-            .get_json::<HashMap<String, SteamAppDetailsEnvelope>>(&url)
-            .await?;
+        let appid_u32 = u32::try_from(appid)
+            .map_err(|_| AppError::Other(format!("invalid Steam appid for lookup: {appid}")))?;
+        let results = self.fetch_app_details_batch(&[appid_u32]).await?;
 
-        Ok(payload
-            .get(&appid.to_string())
-            .filter(|envelope| envelope.success)
-            .and_then(|envelope| envelope.data.clone()))
+        match results.get(&appid_u32) {
+            Some(AppDetailsResult::Available(details)) => Ok(Some((**details).clone())),
+            Some(AppDetailsResult::Unavailable) | None => Ok(None),
+            Some(AppDetailsResult::RateLimited) => Err(AppError::Other(
+                "Steam temporarily rate limited appdetails (429)".to_string(),
+            )),
+        }
     }
 
-    pub fn detect_free_promotion(
+    pub async fn fetch_app_details_batch(
         &self,
-        details: &SteamAppData,
-        candidate: Option<&SteamCandidate>,
-    ) -> Option<FreePromotion> {
-        detector::detect_free_promotion(details, candidate)
+        appids: &[u32],
+    ) -> AppResult<HashMap<u32, AppDetailsResult>> {
+        if appids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let joined = appids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let url = format!(
+            "https://store.steampowered.com/api/appdetails?appids={joined}&cc={}&l={}",
+            self.country, self.language
+        );
+        let retry_delays = [Duration::from_secs(5), Duration::from_secs(15)];
+
+        for attempt in 0..=retry_delays.len() {
+            debug!(url = %url, batch_size = appids.len(), attempt, "Steam HTTP request starting");
+            let response = self.http.get(&url).send().await?;
+
+            if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                if let Some(delay) = retry_delays.get(attempt) {
+                    warn!(
+                        batch_size = appids.len(),
+                        retry_in_seconds = delay.as_secs(),
+                        "Steam appdetails batch hit 429, retrying"
+                    );
+                    sleep(*delay).await;
+                    continue;
+                }
+
+                warn!(
+                    batch_size = appids.len(),
+                    "Steam appdetails batch stayed rate limited after retries"
+                );
+                return Ok(appids
+                    .iter()
+                    .copied()
+                    .map(|appid| (appid, AppDetailsResult::RateLimited))
+                    .collect());
+            }
+
+            let response = response.error_for_status()?;
+            let text = response.text().await?;
+            debug!(
+                url = %url,
+                bytes = text.len(),
+                "Steam HTTP response text received"
+            );
+            debug!(url = %url, "Steam JSON parse starting");
+            let payload = serde_json::from_str::<Value>(&text)?;
+            debug!(url = %url, "Steam JSON parse finished");
+
+            return Ok(parse_app_details_batch_payload(appids, &payload));
+        }
+
+        Ok(appids
+            .iter()
+            .copied()
+            .map(|appid| (appid, AppDetailsResult::RateLimited))
+            .collect())
     }
 
     pub fn evaluate_free_promotion(
@@ -225,4 +289,34 @@ impl SteamClient {
         );
         Ok(text)
     }
+}
+
+fn parse_app_details_batch_payload(
+    appids: &[u32],
+    payload: &Value,
+) -> HashMap<u32, AppDetailsResult> {
+    let mut results = HashMap::with_capacity(appids.len());
+
+    for appid in appids {
+        let key = appid.to_string();
+        let result = match payload.get(&key) {
+            Some(envelope) => match envelope.get("success").and_then(Value::as_bool) {
+                Some(true) => match envelope.get("data").cloned() {
+                    Some(data) if !data.is_null() => {
+                        match serde_json::from_value::<SteamAppData>(data) {
+                            Ok(details) => AppDetailsResult::Available(Box::new(details)),
+                            Err(_) => AppDetailsResult::Unavailable,
+                        }
+                    }
+                    _ => AppDetailsResult::Unavailable,
+                },
+                _ => AppDetailsResult::Unavailable,
+            },
+            None => AppDetailsResult::Unavailable,
+        };
+
+        results.insert(*appid, result);
+    }
+
+    results
 }

@@ -11,7 +11,10 @@ use crate::{
     db::{models::PriceEventRecord, repository::Repository},
     deepseek::{client::DeepSeekClient, AiDescription},
     error::{AppError, AppResult},
-    steam::{FreePromotion, SteamCandidate, SteamClient},
+    steam::{
+        AppDetailsResult, FreePromotion, PromotionEvaluation, PromotionSkipReason, SteamCandidate,
+        SteamClient,
+    },
     telegram::{formatting::build_post, publisher::TelegramPublisher},
     utils::time::parse_rfc3339_utc,
 };
@@ -22,6 +25,9 @@ pub struct CheckSummary {
     pub target_chats: usize,
     pub candidate_app_ids: usize,
     pub app_details_fetched: usize,
+    pub app_details_unavailable: usize,
+    pub rate_limited: usize,
+    pub skipped_apps: usize,
     pub valid_free_promotions: usize,
     pub posts_attempted: usize,
     pub posts_successfully_sent: usize,
@@ -30,33 +36,39 @@ pub struct CheckSummary {
     pub telegram_failures: usize,
     pub errors: usize,
     pub steam_request_failed: bool,
+    pub skip_breakdown: HashMap<PromotionSkipReason, usize>,
 }
 
 impl CheckSummary {
-    pub fn likely_reason(&self) -> Option<&'static str> {
+    pub fn record_skip(&mut self, reason: PromotionSkipReason) {
+        if !matches!(reason, PromotionSkipReason::AppDetailsUnavailable) {
+            self.skipped_apps += 1;
+        }
+
+        *self.skip_breakdown.entry(reason).or_insert(0) += 1;
+    }
+
+    pub fn likely_reason_ru(&self) -> Option<&'static str> {
         if self.posts_successfully_sent > 0 {
             return None;
         }
         if self.steam_request_failed {
-            return Some("Steam request failed");
+            return Some("не удалось получить данные Steam.");
         }
         if self.target_chats == 0 && self.valid_free_promotions > 0 {
-            return Some("no enabled chats configured");
+            return Some("нет включенных чатов для публикации.");
         }
-        if self.valid_free_promotions == 0 {
-            return Some("no valid 100% free paid-game promotions found");
+        if self.valid_free_promotions == 0 && self.errors == 0 {
+            return Some("временно бесплатных платных игр сейчас не найдено.");
         }
         if self.posts_attempted == 0 && self.duplicate_posts_skipped > 0 {
-            return Some("all valid promotions were already published");
+            return Some("все валидные акции уже были опубликованы.");
         }
         if self.posts_attempted > 0
             && self.posts_successfully_sent == 0
             && self.telegram_failures > 0
         {
-            return Some("Telegram publish failed");
-        }
-        if self.posts_successfully_sent == 0 && self.deepseek_failures > 0 {
-            return Some("DeepSeek failed");
+            return Some("публикация в Telegram завершилась ошибкой.");
         }
 
         None
@@ -75,6 +87,8 @@ pub struct CheckRunner {
     deepseek: Arc<DeepSeekClient>,
     publisher: Arc<TelegramPublisher>,
     main_channel_id: Option<String>,
+    steam_appdetails_batch_size: usize,
+    steam_appdetails_batch_delay_ms: u64,
     run_lock: Arc<Mutex<()>>,
 }
 
@@ -85,6 +99,8 @@ impl CheckRunner {
         deepseek: Arc<DeepSeekClient>,
         publisher: Arc<TelegramPublisher>,
         main_channel_id: Option<String>,
+        steam_appdetails_batch_size: usize,
+        steam_appdetails_batch_delay_ms: u64,
     ) -> Self {
         Self {
             repo,
@@ -92,6 +108,8 @@ impl CheckRunner {
             deepseek,
             publisher,
             main_channel_id,
+            steam_appdetails_batch_size,
+            steam_appdetails_batch_delay_ms,
             run_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -144,7 +162,8 @@ impl CheckRunner {
             Err(error) => {
                 summary.errors += 1;
                 summary.steam_request_failed = true;
-                return Err(error);
+                error!("Steam candidate fetch failed: {error}");
+                return Ok(summary);
             }
         };
         summary.candidate_app_ids = fetched_candidates.len();
@@ -176,32 +195,112 @@ impl CheckRunner {
         let mut appids = candidate_map.keys().copied().collect::<Vec<_>>();
         appids.sort_unstable();
 
-        for appid in appids {
-            let candidate = candidate_map.get(&appid);
-            let details = match self.steam.fetch_app_details(appid).await {
-                Ok(Some(details)) => {
-                    summary.app_details_fetched += 1;
-                    details
-                }
-                Ok(None) => continue,
+        let batch_size = self.steam_appdetails_batch_size.max(1);
+
+        for (batch_index, batch) in appids.chunks(batch_size).enumerate() {
+            let batch_u32 = match batch
+                .iter()
+                .copied()
+                .map(|appid| {
+                    u32::try_from(appid).map_err(|_| {
+                        AppError::Other(format!("invalid Steam appid in batch: {appid}"))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(batch_u32) => batch_u32,
                 Err(error) => {
                     summary.errors += 1;
-                    warn!("Steam details fetch failed for app {appid}: {error}");
+                    warn!("Skipping invalid appdetails batch: {error}");
                     continue;
                 }
             };
 
-            let game = self.steam.build_game_data(&details, candidate);
-            if let Err(error) = self.repo.upsert_game(&game).await {
-                summary.errors += 1;
-                warn!(
-                    "Failed to upsert game {} ({}): {error}",
-                    game.appid, game.name
-                );
-                continue;
+            match self.steam.fetch_app_details_batch(&batch_u32).await {
+                Ok(details_map) => {
+                    for appid_u32 in batch_u32 {
+                        let appid = i64::from(appid_u32);
+                        let candidate = candidate_map.get(&appid);
+
+                        match details_map.get(&appid_u32) {
+                            Some(AppDetailsResult::Available(details)) => {
+                                summary.app_details_fetched += 1;
+                                self.process_app_details(
+                                    &mut summary,
+                                    &target_chat_ids,
+                                    &active_map,
+                                    candidate,
+                                    appid,
+                                    details.as_ref(),
+                                )
+                                .await;
+                            }
+                            Some(AppDetailsResult::Unavailable) | None => {
+                                summary.app_details_unavailable += 1;
+                                summary.record_skip(PromotionSkipReason::AppDetailsUnavailable);
+                            }
+                            Some(AppDetailsResult::RateLimited) => {
+                                summary.rate_limited += 1;
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    summary.errors += 1;
+                    warn!(
+                        batch_index,
+                        batch_size = batch.len(),
+                        "Steam appdetails batch failed: {error}"
+                    );
+                }
             }
 
-            if let Some(mut promotion) = self.steam.detect_free_promotion(&details, candidate) {
+            let has_more_batches = (batch_index + 1) * batch_size < appids.len();
+            if has_more_batches && self.steam_appdetails_batch_delay_ms > 0 {
+                time::sleep(Duration::from_millis(self.steam_appdetails_batch_delay_ms)).await;
+            }
+        }
+
+        info!(
+            reason = %summary.reason,
+            target_chats = summary.target_chats,
+            candidate_app_ids = summary.candidate_app_ids,
+            app_details_fetched = summary.app_details_fetched,
+            app_details_unavailable = summary.app_details_unavailable,
+            rate_limited = summary.rate_limited,
+            skipped_apps = summary.skipped_apps,
+            valid_free_promotions = summary.valid_free_promotions,
+            posts_attempted = summary.posts_attempted,
+            posts_successfully_sent = summary.posts_successfully_sent,
+            duplicate_posts_skipped = summary.duplicate_posts_skipped,
+            errors = summary.errors,
+            "Steam check finished"
+        );
+
+        Ok(summary)
+    }
+
+    async fn process_app_details(
+        &self,
+        summary: &mut CheckSummary,
+        target_chat_ids: &[String],
+        active_map: &HashMap<i64, PriceEventRecord>,
+        candidate: Option<&SteamCandidate>,
+        appid: i64,
+        details: &crate::steam::SteamAppData,
+    ) {
+        let game = self.steam.build_game_data(details, candidate);
+        if let Err(error) = self.repo.upsert_game(&game).await {
+            summary.errors += 1;
+            warn!(
+                "Failed to upsert game {} ({}): {error}",
+                game.appid, game.name
+            );
+            return;
+        }
+
+        match self.steam.evaluate_free_promotion(details, candidate) {
+            PromotionEvaluation::Publishable(mut promotion) => {
                 summary.valid_free_promotions += 1;
 
                 if promotion.free_until.is_none() {
@@ -222,12 +321,12 @@ impl CheckRunner {
                             "Failed to create price event for app {}: {error}",
                             game.appid
                         );
-                        continue;
+                        return;
                     }
                 };
 
                 if target_chat_ids.is_empty() {
-                    continue;
+                    return;
                 }
 
                 let ai_outcome = match load_ai_description(
@@ -257,7 +356,7 @@ impl CheckRunner {
 
                 let post = build_post(&game, &promotion, &ai_outcome.description);
 
-                for chat_id in &target_chat_ids {
+                for chat_id in target_chat_ids {
                     match self
                         .repo
                         .has_published_post(game.appid, chat_id, price_event.id)
@@ -310,28 +409,18 @@ impl CheckRunner {
                         }
                     }
                 }
-            } else if active_map.contains_key(&appid) {
-                if let Err(error) = self.repo.end_active_price_events_for_app(appid).await {
-                    summary.errors += 1;
-                    warn!("Failed to close active promotion for app {appid}: {error}");
+            }
+            PromotionEvaluation::Skipped(reason) => {
+                summary.record_skip(reason);
+
+                if active_map.contains_key(&appid) {
+                    if let Err(error) = self.repo.end_active_price_events_for_app(appid).await {
+                        summary.errors += 1;
+                        warn!("Failed to close active promotion for app {appid}: {error}");
+                    }
                 }
             }
         }
-
-        info!(
-            reason = %summary.reason,
-            target_chats = summary.target_chats,
-            candidate_app_ids = summary.candidate_app_ids,
-            app_details_fetched = summary.app_details_fetched,
-            valid_free_promotions = summary.valid_free_promotions,
-            posts_attempted = summary.posts_attempted,
-            posts_successfully_sent = summary.posts_successfully_sent,
-            duplicate_posts_skipped = summary.duplicate_posts_skipped,
-            errors = summary.errors,
-            "Steam check finished"
-        );
-
-        Ok(summary)
     }
 }
 
