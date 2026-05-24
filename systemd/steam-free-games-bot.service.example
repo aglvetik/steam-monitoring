@@ -1,0 +1,15 @@
+[Unit]
+Description=Steam Free Games Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/steam-free-games-bot
+ExecStart=/opt/steam-free-games-bot/target/release/steam-free-games-bot
+Restart=always
+RestartSec=5
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target
+
