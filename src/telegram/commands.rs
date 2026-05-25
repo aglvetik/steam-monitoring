@@ -10,6 +10,7 @@ pub enum TelegramCommand {
     DebugSteamHttp,
     DebugStoreSearch,
     DebugSteamDb,
+    DebugFreeUntil { appid: Option<String> },
     TestPost,
     PreviewApp { appid: Option<String> },
 }
@@ -53,6 +54,9 @@ impl TelegramCommand {
             "debug_steam_http" => Some(Self::DebugSteamHttp),
             "debug_store_search" => Some(Self::DebugStoreSearch),
             "debug_steamdb" => Some(Self::DebugSteamDb),
+            "debug_free_until" => Some(Self::DebugFreeUntil {
+                appid: if args.is_empty() { None } else { Some(args) },
+            }),
             "test_post" => Some(Self::TestPost),
             "preview_app" => Some(Self::PreviewApp {
                 appid: if args.is_empty() { None } else { Some(args) },

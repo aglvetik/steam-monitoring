@@ -49,6 +49,7 @@ pub struct CheckSummary {
     pub steamdb_source_error: Option<String>,
     pub appdetails_requests: usize,
     pub app_details_fetched: usize,
+    pub free_until_found: usize,
     pub app_details_unavailable: usize,
     pub rate_limited: usize,
     pub skipped_apps: usize,
@@ -117,6 +118,8 @@ pub struct CheckRunner {
     deepseek: Arc<DeepSeekClient>,
     publisher: Arc<TelegramPublisher>,
     main_channel_id: Option<String>,
+    enable_store_page_free_until_lookup: bool,
+    store_page_lookup_delay_ms: u64,
     run_lock: Arc<Mutex<()>>,
 }
 
@@ -127,6 +130,8 @@ impl CheckRunner {
         deepseek: Arc<DeepSeekClient>,
         publisher: Arc<TelegramPublisher>,
         main_channel_id: Option<String>,
+        enable_store_page_free_until_lookup: bool,
+        store_page_lookup_delay_ms: u64,
     ) -> Self {
         Self {
             repo,
@@ -134,6 +139,8 @@ impl CheckRunner {
             deepseek,
             publisher,
             main_channel_id,
+            enable_store_page_free_until_lookup,
+            store_page_lookup_delay_ms,
             run_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -258,6 +265,7 @@ impl CheckRunner {
             steamdb_free_to_keep = summary.steamdb_free_to_keep,
             appdetails_requests = summary.appdetails_requests,
             app_details_fetched = summary.app_details_fetched,
+            free_until_found = summary.free_until_found,
             rate_limited = summary.rate_limited,
             valid_free_promotions = summary.valid_free_promotions,
             posts_successfully_sent = summary.posts_successfully_sent,
@@ -388,7 +396,49 @@ impl CheckRunner {
                 discount_percent = entry.discount_percent,
                 "Store Search candidate accepted by source price"
             );
-            let candidate = entry.to_candidate();
+            let mut candidate = entry.to_candidate();
+
+            if self.enable_store_page_free_until_lookup {
+                match u32::try_from(candidate.appid) {
+                    Ok(appid_u32) => {
+                        info!(appid = appid_u32, "Store page free_until lookup started");
+                        match self.steam.lookup_app_store_page_free_until(appid_u32).await {
+                            Ok(report) => {
+                                if let Some(free_until) = report.free_until {
+                                    summary.free_until_found += 1;
+                                    candidate.free_until = Some(free_until);
+                                    info!(
+                                        appid = report.appid,
+                                        free_until = %free_until,
+                                        diagnostic = %report.diagnostic,
+                                        "Store page free_until found"
+                                    );
+                                } else {
+                                    info!(
+                                        appid = report.appid,
+                                        diagnostic = %report.diagnostic,
+                                        matched_text = report.matched_text.as_deref().unwrap_or("n/a"),
+                                        "Store page free_until not found"
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                warn!(
+                                    appid = appid_u32,
+                                    "Store page lookup failed but continuing without date: {error}"
+                                );
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        warn!(
+                            appid = candidate.appid,
+                            "Store page lookup skipped because appid is invalid"
+                        );
+                    }
+                }
+            }
+
             if let Some(details_result) = self
                 .get_or_fetch_app_details(summary, appdetails_cache, candidate.appid)
                 .await
@@ -404,6 +454,9 @@ impl CheckRunner {
             }
 
             if index + 1 < store_search_entries.len() {
+                if self.enable_store_page_free_until_lookup && self.store_page_lookup_delay_ms > 0 {
+                    time::sleep(Duration::from_millis(self.store_page_lookup_delay_ms)).await;
+                }
                 time::sleep(Duration::from_millis(APPDETAILS_REQUEST_DELAY_MS)).await;
             }
         }

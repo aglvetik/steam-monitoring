@@ -13,6 +13,7 @@ use super::{
     models::SteamAppDetailsEnvelope,
     sources::FeaturedCategoriesSource,
     steamdb::{SteamDbFreePromotionsReport, SteamDbFreePromotionsSource},
+    store_page::{extract_free_until_from_store_page_html, StorePageFreeUntilReport},
     store_search::{SteamStoreSearchFreeSpecialsSource, SteamStoreSearchReport},
     PromotionEvaluation, SteamAppData, SteamCandidate, SteamGameData,
 };
@@ -96,6 +97,13 @@ impl SteamClient {
         &self.language
     }
 
+    pub fn app_store_url(&self, appid: u32) -> String {
+        format!(
+            "https://store.steampowered.com/app/{appid}/?cc={}&l={}",
+            self.country, self.language
+        )
+    }
+
     pub async fn fetch_candidate_free_promotions(&self) -> AppResult<Vec<SteamCandidate>> {
         let mut values = self.featured_source.fetch(self).await?;
         values.sort_by_key(|item| item.appid);
@@ -114,6 +122,30 @@ impl SteamClient {
         self.store_search_source
             .fetch(&self.http, &self.country, &self.language)
             .await
+    }
+
+    pub async fn fetch_app_store_page(&self, appid: u32) -> AppResult<String> {
+        let url = self.app_store_url(appid);
+        self.fetch_text(&url).await
+    }
+
+    pub async fn lookup_app_store_page_free_until(
+        &self,
+        appid: u32,
+    ) -> AppResult<StorePageFreeUntilReport> {
+        let url = self.app_store_url(appid);
+        let html = self.fetch_app_store_page(appid).await?;
+        let response_bytes = html.len();
+        let extraction = extract_free_until_from_store_page_html(&html, chrono::Utc::now());
+
+        Ok(StorePageFreeUntilReport {
+            appid,
+            url,
+            response_bytes,
+            free_until: extraction.free_until,
+            diagnostic: extraction.diagnostic,
+            matched_text: extraction.matched_text,
+        })
     }
 
     pub async fn fetch_steamdb_free_promotions(&self) -> SteamDbFreePromotionsReport {

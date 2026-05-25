@@ -3,6 +3,7 @@ pub mod detector;
 pub mod models;
 pub mod sources;
 pub mod steamdb;
+pub mod store_page;
 pub mod store_search;
 
 pub use client::{AppDetailsResult, SteamClient, SteamClientConfig, SteamHttpDebugReport};

@@ -62,6 +62,7 @@ These commands are not shown in the public command menu. They can still be used 
 - `/debug_steam_http`
 - `/debug_store_search`
 - `/debug_steamdb`
+- `/debug_free_until <appid>`
 - `/test_post`
 - `/preview_app <appid>`
 
@@ -116,6 +117,8 @@ Fill in the values you need:
 | `ENABLE_STEAM_STORE_SEARCH_SOURCE` | Enable or disable the Steam Store Search source |
 | `STEAM_STORE_SEARCH_COUNT` | Number of search rows requested from Steam Store Search |
 | `STEAM_STORE_SEARCH_URL` | Steam Store Search endpoint URL |
+| `ENABLE_STORE_PAGE_FREE_UNTIL_LOOKUP` | Best-effort lookup of promotion end dates from individual Steam app pages |
+| `STORE_PAGE_LOOKUP_DELAY_MS` | Delay between Steam Store app page free-until lookups |
 | `ENABLE_STEAMDB_SOURCE` | Enable or disable the optional SteamDB source, default `false` |
 | `STEAMDB_FREE_PROMOTIONS_URL` | SteamDB Free Promotions page URL |
 | `STEAMDB_USER_AGENT` | User-Agent used for SteamDB requests |
@@ -187,6 +190,7 @@ On startup the bot will:
 - It parses `results_html` from the official Steam Store search endpoint.
 - Only rows that already look like paid games with a 100% discount and final price `0` are sent to `appdetails`.
 - This source helps catch some free-to-keep promotions that are missing from `featuredcategories`.
+- When enabled, the bot also does a best-effort lookup on the individual Steam app page to extract the promotion end date from the visible discount countdown or embedded promo text.
 
 ### SteamDB Free Promotions
 
@@ -308,6 +312,7 @@ sudo journalctl -u steam-free-games-bot -f
 - Admin `/debug_steam_http`
 - Admin `/debug_store_search`
 - Admin `/debug_steamdb`
+- Admin `/debug_free_until 489630`
 - Admin `/preview_app 570`
 
 ## Known limitations

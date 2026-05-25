@@ -16,6 +16,8 @@ pub struct Config {
     pub enable_steam_store_search_source: bool,
     pub steam_store_search_count: u32,
     pub steam_store_search_url: String,
+    pub enable_store_page_free_until_lookup: bool,
+    pub store_page_lookup_delay_ms: u64,
     pub enable_steamdb_source: bool,
     pub steamdb_free_promotions_url: String,
     pub steamdb_user_agent: String,
@@ -54,6 +56,19 @@ impl Config {
             .unwrap_or(100);
         let steam_store_search_url = env::var("STEAM_STORE_SEARCH_URL")
             .unwrap_or_else(|_| "https://store.steampowered.com/search/results/".to_string());
+        let enable_store_page_free_until_lookup = env::var("ENABLE_STORE_PAGE_FREE_UNTIL_LOOKUP")
+            .ok()
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(true);
+        let store_page_lookup_delay_ms = env::var("STORE_PAGE_LOOKUP_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(800);
         let enable_steamdb_source = env::var("ENABLE_STEAMDB_SOURCE")
             .ok()
             .map(|value| {
@@ -101,6 +116,8 @@ impl Config {
             enable_steam_store_search_source,
             steam_store_search_count,
             steam_store_search_url,
+            enable_store_page_free_until_lookup,
+            store_page_lookup_delay_ms,
             enable_steamdb_source,
             steamdb_free_promotions_url,
             steamdb_user_agent,

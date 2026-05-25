@@ -123,6 +123,9 @@ async fn handle_command(
             handle_debug_store_search(bot, msg, config, steam).await
         }
         TelegramCommand::DebugSteamDb => handle_debug_steamdb(bot, msg, config, steam).await,
+        TelegramCommand::DebugFreeUntil { appid } => {
+            handle_debug_free_until(bot, msg, config, steam, appid).await
+        }
         TelegramCommand::TestPost => handle_test_post(bot, msg, repo, config).await,
         TelegramCommand::PreviewApp { appid } => {
             handle_preview_app(bot, msg, config, steam, appid).await
@@ -373,6 +376,106 @@ async fn handle_debug_store_search(
     Ok(())
 }
 
+async fn handle_debug_free_until(
+    bot: &Bot,
+    msg: &Message,
+    config: &Config,
+    steam: &SteamClient,
+    appid_arg: Option<String>,
+) -> AppResult<()> {
+    if !ensure_admin(bot, msg, config).await? {
+        return Ok(());
+    }
+
+    if !msg.chat.is_private() {
+        send_admin_reply(
+            bot,
+            msg.chat.id,
+            "Выполните /debug_free_until в личном чате с ботом.",
+            "Failed to send /debug_free_until private-chat hint",
+        )
+        .await;
+        return Ok(());
+    }
+
+    let Some(appid_arg) = appid_arg else {
+        send_admin_reply(
+            bot,
+            msg.chat.id,
+            "Использование: /debug_free_until <appid>",
+            "Failed to send /debug_free_until usage reply",
+        )
+        .await;
+        return Ok(());
+    };
+
+    let Ok(appid) = appid_arg.trim().parse::<u32>() else {
+        send_admin_reply(
+            bot,
+            msg.chat.id,
+            "App ID должен быть положительным числом.",
+            "Failed to send /debug_free_until validation reply",
+        )
+        .await;
+        return Ok(());
+    };
+
+    match steam.lookup_app_store_page_free_until(appid).await {
+        Ok(report) => {
+            let status = if report.free_until.is_some() {
+                "найдено"
+            } else {
+                "не найдено"
+            };
+            let free_until = report
+                .free_until
+                .map(|value| format_berlin_datetime(&value))
+                .unwrap_or_else(|| "не найдено".to_string());
+            let fragment = report.matched_text.unwrap_or_else(|| "n/a".to_string());
+            let reply = format!(
+                "Проверка free_until Steam Store\n\n\
+                 AppID: {}\n\
+                 URL: {}\n\
+                 Response bytes: {}\n\
+                 Статус: {}\n\
+                 Бесплатно до: {}\n\
+                 Диагностика: {}\n\
+                 Фрагмент: {}",
+                report.appid,
+                report.url,
+                report.response_bytes,
+                status,
+                free_until,
+                report.diagnostic,
+                truncate_chars(&fragment, 220),
+            );
+
+            send_admin_reply(
+                bot,
+                msg.chat.id,
+                reply,
+                "Failed to send /debug_free_until reply",
+            )
+            .await;
+        }
+        Err(error) => {
+            error!("Steam store page free_until lookup failed for app {appid}: {error}");
+            send_admin_reply(
+                bot,
+                msg.chat.id,
+                format!(
+                    "Не удалось получить страницу Steam: {}",
+                    short_error_message(&error.to_string())
+                ),
+                "Failed to send /debug_free_until error reply",
+            )
+            .await;
+        }
+    }
+
+    Ok(())
+}
+
 async fn handle_test_post(
     bot: &Bot,
     msg: &Message,
@@ -600,6 +703,7 @@ fn format_check_summary(summary: &CheckSummary) -> String {
         format!("SteamDB Free to Keep: {}", summary.steamdb_free_to_keep),
         format!("Запросов appdetails: {}", summary.appdetails_requests),
         format!("Детали получены: {}", summary.app_details_fetched),
+        format!("Дат окончания найдено: {}", summary.free_until_found),
         format!("Валидных акций: {}", summary.valid_free_promotions),
         format!(
             "Опубликовано сообщений: {}",
