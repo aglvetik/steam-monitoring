@@ -12,10 +12,11 @@ use crate::{
     deepseek::{client::DeepSeekClient, AiDescription},
     error::{AppError, AppResult},
     steam::{
-        looks_like_excluded_title, prefilter_candidate, AppDetailsResult,
-        CandidatePrefilterDecision, FreePromotion, PromotionEvaluation, PromotionSkipReason,
-        SteamCandidate, SteamClient, SteamDbPromotionEntry, SteamStoreSearchEntry,
-        STEAMDB_FREE_TO_KEEP_SOURCE_NAME, STEAM_STORE_SEARCH_SOURCE_NAME,
+        looks_like_excluded_title, prefilter_candidate,
+        validate_metadata_for_trusted_free_candidate, AppDetailsResult, CandidatePrefilterDecision,
+        FreePromotion, PromotionEvaluation, PromotionSkipReason, SteamCandidate, SteamClient,
+        SteamDbPromotionEntry, SteamStoreSearchEntry, STEAMDB_FREE_TO_KEEP_SOURCE_NAME,
+        STEAM_STORE_SEARCH_SOURCE_NAME,
     },
     telegram::{formatting::build_post, publisher::TelegramPublisher},
     utils::time::parse_rfc3339_utc,
@@ -379,6 +380,14 @@ impl CheckRunner {
         );
 
         for (index, entry) in store_search_entries.iter().enumerate() {
+            info!(
+                appid = entry.appid,
+                name = %entry.name,
+                regular_price_cents = entry.regular_price_cents,
+                final_price_cents = entry.final_price_cents,
+                discount_percent = entry.discount_percent,
+                "Store Search candidate accepted by source price"
+            );
             let candidate = entry.to_candidate();
             if let Some(details_result) = self
                 .get_or_fetch_app_details(summary, appdetails_cache, candidate.appid)
@@ -661,6 +670,62 @@ impl CheckRunner {
         candidate: &SteamCandidate,
         details: &crate::steam::SteamAppData,
     ) -> PromotionEvaluation {
+        if candidate.source == STEAM_STORE_SEARCH_SOURCE_NAME
+            && candidate.regular_price_cents.unwrap_or_default() > 0
+            && candidate.final_price_cents == Some(0)
+            && candidate.discount_percent.unwrap_or_default() == 100
+        {
+            match validate_metadata_for_trusted_free_candidate(details) {
+                Ok(()) => {
+                    info!(
+                        appid = details.steam_appid.unwrap_or(candidate.appid),
+                        kind = ?details.kind,
+                        is_free = details.is_free.unwrap_or(false),
+                        "Appdetails confirmed game metadata for trusted Store Search candidate"
+                    );
+
+                    if let Some(price) = details.price_overview.as_ref() {
+                        if price.r#final != 0 || price.discount_percent != 100 || price.initial <= 0
+                        {
+                            info!(
+                                appid = details.steam_appid.unwrap_or(candidate.appid),
+                                appdetails_initial = price.initial,
+                                appdetails_final = price.r#final,
+                                appdetails_discount_percent = price.discount_percent,
+                                trusted_initial = candidate.regular_price_cents.unwrap_or_default(),
+                                trusted_final = candidate.final_price_cents.unwrap_or_default(),
+                                trusted_discount_percent = candidate.discount_percent.unwrap_or_default(),
+                                "Appdetails price ignored because Store Search has trusted 100% free price snapshot"
+                            );
+                        }
+                    } else {
+                        info!(
+                            appid = details.steam_appid.unwrap_or(candidate.appid),
+                            "Appdetails price missing; using trusted Store Search price snapshot"
+                        );
+                    }
+
+                    return PromotionEvaluation::Publishable(FreePromotion {
+                        appid: details.steam_appid.unwrap_or(candidate.appid),
+                        currency: candidate.currency.clone(),
+                        regular_price_cents: candidate.regular_price_cents,
+                        final_price_cents: candidate.final_price_cents,
+                        discount_percent: candidate.discount_percent,
+                        free_until: candidate.free_until,
+                        source: candidate.source.clone(),
+                    });
+                }
+                Err(reason) => {
+                    info!(
+                        appid = details.steam_appid.unwrap_or(candidate.appid),
+                        reason = ?reason,
+                        "Store Search candidate rejected by appdetails metadata"
+                    );
+                    return PromotionEvaluation::Skipped(reason);
+                }
+            }
+        }
+
         let evaluation = self.steam.evaluate_free_promotion(details, Some(candidate));
 
         match evaluation {
@@ -676,25 +741,6 @@ impl CheckRunner {
                     regular_price_cents: None,
                     final_price_cents: Some(0),
                     discount_percent: Some(100),
-                    free_until: candidate.free_until,
-                    source: candidate.source.clone(),
-                })
-            }
-            PromotionEvaluation::Skipped(PromotionSkipReason::MissingPriceOverview)
-                if candidate.source == STEAM_STORE_SEARCH_SOURCE_NAME
-                    && details.kind.as_deref() == Some("game")
-                    && !details.is_free.unwrap_or(false)
-                    && !looks_like_excluded_title(&details.name)
-                    && candidate.regular_price_cents.unwrap_or_default() > 0
-                    && candidate.final_price_cents == Some(0)
-                    && candidate.discount_percent.unwrap_or_default() == 100 =>
-            {
-                PromotionEvaluation::Publishable(FreePromotion {
-                    appid: details.steam_appid.unwrap_or(candidate.appid),
-                    currency: candidate.currency.clone(),
-                    regular_price_cents: candidate.regular_price_cents,
-                    final_price_cents: candidate.final_price_cents,
-                    discount_percent: candidate.discount_percent,
                     free_until: candidate.free_until,
                     source: candidate.source.clone(),
                 })

@@ -7,8 +7,8 @@ pub mod store_search;
 
 pub use client::{AppDetailsResult, SteamClient, SteamClientConfig, SteamHttpDebugReport};
 pub use detector::{
-    looks_like_excluded_title, prefilter_candidate, CandidatePrefilterDecision,
-    PromotionEvaluation, PromotionSkipReason,
+    looks_like_excluded_title, prefilter_candidate, validate_metadata_for_trusted_free_candidate,
+    CandidatePrefilterDecision, PromotionEvaluation, PromotionSkipReason,
 };
 pub use models::{
     FreePromotion, SearchResultsResponse, SteamAppData, SteamCandidate, SteamGameData,

@@ -211,6 +211,24 @@ pub fn build_game_data(
     }
 }
 
+pub fn validate_metadata_for_trusted_free_candidate(
+    details: &SteamAppData,
+) -> Result<(), PromotionSkipReason> {
+    if details.name.trim().is_empty() {
+        return Err(PromotionSkipReason::MissingRequiredFields);
+    }
+
+    if !is_supported_game_type(details.kind.as_deref()) {
+        return Err(PromotionSkipReason::UnsupportedAppType);
+    }
+
+    if is_free_to_play(details) {
+        return Err(PromotionSkipReason::FreeToPlay);
+    }
+
+    Ok(())
+}
+
 fn is_supported_game_type(kind: Option<&str>) -> bool {
     let Some(kind) = kind else {
         return true;
@@ -228,4 +246,53 @@ fn is_free_to_play(details: &SteamAppData) -> bool {
         .unwrap_or_default();
 
     details.is_free.unwrap_or(false) && initial_price <= 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_app() -> SteamAppData {
+        SteamAppData {
+            kind: Some("game".to_string()),
+            name: "Test Game".to_string(),
+            steam_appid: Some(123),
+            is_free: Some(false),
+            price_overview: Some(super::super::models::PriceOverview {
+                currency: "EUR".to_string(),
+                initial: 1999,
+                r#final: 1999,
+                discount_percent: 0,
+                initial_formatted: None,
+                final_formatted: None,
+            }),
+            header_image: None,
+            capsule_image: None,
+            short_description: None,
+            genres: None,
+            categories: None,
+        }
+    }
+
+    #[test]
+    fn trusted_free_candidate_metadata_allows_paid_game_even_when_price_not_zero() {
+        let app = base_app();
+        assert_eq!(validate_metadata_for_trusted_free_candidate(&app), Ok(()));
+        assert!(matches!(
+            evaluate_free_promotion(&app, None),
+            PromotionEvaluation::Skipped(PromotionSkipReason::FinalPriceNotZero)
+        ));
+    }
+
+    #[test]
+    fn trusted_free_candidate_metadata_rejects_free_to_play() {
+        let mut app = base_app();
+        app.is_free = Some(true);
+        app.price_overview = None;
+
+        assert_eq!(
+            validate_metadata_for_trusted_free_candidate(&app),
+            Err(PromotionSkipReason::FreeToPlay)
+        );
+    }
 }
