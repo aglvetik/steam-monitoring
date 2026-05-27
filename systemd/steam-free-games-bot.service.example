@@ -1,15 +1,16 @@
 [Unit]
 Description=Steam Free Games Telegram Bot
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/steam-free-games-bot
-ExecStart=/opt/steam-free-games-bot/target/release/steam-free-games-bot
+WorkingDirectory=/opt/steam-monitoring/steam-monitoring
+ExecStart=/opt/steam-monitoring/steam-monitoring/scripts/start-bot.sh
 Restart=always
-RestartSec=5
+RestartSec=10
+RuntimeMaxSec=86400
 Environment=RUST_LOG=info
 
 [Install]
 WantedBy=multi-user.target
-

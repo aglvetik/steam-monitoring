@@ -125,7 +125,7 @@ Fill in the values you need:
 | `STEAMDB_TIMEOUT_SECONDS` | HTTP timeout for SteamDB page fetch |
 | `CHECK_INTERVAL_MINUTES` | Scheduler interval in minutes |
 | `RUN_STARTUP_CHECK` | If `true`, run a Steam check immediately on startup |
-| `DATABASE_URL` | SQLite URL, default `sqlite://data/bot.sqlite` |
+| `DATABASE_URL` | SQLite URL, default `sqlite://data/bot.sqlite`. On VPS prefer an absolute path such as `sqlite:///opt/steam-monitoring/steam-monitoring/data/bot.sqlite` |
 | `RUST_LOG` | Log level, for example `info` |
 
 `.env` is intentionally not committed.
@@ -272,33 +272,62 @@ SQLite tables are created by [migrations/0001_init.sql](./migrations/0001_init.s
 
 ## systemd deployment
 
-1. Build a release binary:
+Production VPS path used by this bot:
+
+- project root: `/opt/steam-monitoring/steam-monitoring`
+- binary: `/opt/steam-monitoring/steam-monitoring/target/release/steam-free-games-bot`
+
+1. Copy or clone the project to `/opt/steam-monitoring/steam-monitoring`.
+2. Create a real `.env` in the project root.
+3. For VPS, prefer an absolute SQLite path:
 
 ```bash
+DATABASE_URL=sqlite:///opt/steam-monitoring/steam-monitoring/data/bot.sqlite
+```
+
+4. Build the release binary:
+
+```bash
+cd /opt/steam-monitoring/steam-monitoring
 cargo build --release
 ```
 
-2. Copy the project to your server, for example `/opt/steam-free-games-bot`.
-3. Put your real `.env` file there.
-4. Adjust paths in [systemd/steam-free-games-bot.service.example](./systemd/steam-free-games-bot.service.example).
-5. Install the unit:
+5. Make the wrapper executable:
+
+```bash
+chmod +x scripts/start-bot.sh
+```
+
+6. Install the systemd unit:
 
 ```bash
 sudo cp systemd/steam-free-games-bot.service.example /etc/systemd/system/steam-free-games-bot.service
 ```
 
-6. Reload and start:
+7. Reload systemd and enable autostart:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now steam-free-games-bot
+sudo systemctl enable steam-free-games-bot
 ```
 
-7. Follow logs:
+8. Start or restart the bot:
 
 ```bash
+sudo systemctl restart steam-free-games-bot
+```
+
+9. Check service status and logs:
+
+```bash
+sudo systemctl status steam-free-games-bot --no-pager
 sudo journalctl -u steam-free-games-bot -f
 ```
+
+The wrapper script clears stale pending Telegram updates at startup with
+`deleteWebhook?drop_pending_updates=true`. This prevents a restart storm where
+old queued `/check_now` commands would otherwise run one after another after
+downtime.
 
 ## Useful manual tests
 
