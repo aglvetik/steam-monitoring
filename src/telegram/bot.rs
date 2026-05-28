@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use chrono::{Days, Duration as ChronoDuration, LocalResult, TimeZone, Utc};
 use chrono_tz::Europe::Berlin;
@@ -6,16 +9,16 @@ use teloxide::{
     payloads::GetUpdatesSetters,
     prelude::{Request, Requester},
     types::{ChatId, Message, Update, UpdateKind},
-    Bot,
+    ApiError, Bot, RequestError,
 };
-use tokio::time::sleep;
-use tracing::{error, warn};
+use tokio::time::{sleep, timeout};
+use tracing::{error, info, warn};
 
 use crate::{
     config::Config,
     db::repository::Repository,
     deepseek::AiDescription,
-    error::AppResult,
+    error::{AppError, AppResult},
     scheduler::{CheckRunner, CheckSummary},
     steam::{
         FreePromotion, PromotionEvaluation, PromotionSkipReason, SteamClient,
@@ -30,10 +33,27 @@ use super::{
     publisher::TelegramPublisher,
 };
 
+const GET_UPDATES_LONG_POLL_TIMEOUT_SECONDS: u32 = 30;
+const GET_UPDATES_REQUEST_TIMEOUT_SECONDS: u64 = 75;
+const PERMANENT_POLLING_ERROR_THRESHOLD: u32 = 3;
+
 pub async fn register_commands(bot: &Bot) -> AppResult<()> {
     bot.set_my_commands(TelegramCommand::public_menu_commands())
         .await?;
     Ok(())
+}
+
+enum PollingErrorDisposition {
+    Retry {
+        sleep_for: Duration,
+        context: String,
+    },
+    Permanent {
+        context: String,
+    },
+    Fatal {
+        context: String,
+    },
 }
 
 pub async fn run(
@@ -46,25 +66,97 @@ pub async fn run(
     let me = bot.get_me().await?;
     let bot_username = me.user.username.unwrap_or_default();
     let mut offset = 0i32;
+    let heartbeat_interval = Duration::from_secs(config.telegram_polling_heartbeat_seconds.max(1));
+    let error_sleep = Duration::from_secs(config.telegram_polling_error_sleep_seconds.max(1));
+    let stale_after = Duration::from_secs(config.telegram_polling_stale_seconds.max(1));
+    let request_timeout = Duration::from_secs(GET_UPDATES_REQUEST_TIMEOUT_SECONDS);
+    let mut last_successful_get_updates_at = Instant::now();
+    let mut last_processed_update_at: Option<Instant> = None;
+    let mut last_update_id: Option<u32> = None;
+    let mut next_heartbeat_at = Instant::now() + heartbeat_interval;
+    let mut consecutive_permanent_errors = 0u32;
+
+    info!(
+        heartbeat_seconds = heartbeat_interval.as_secs(),
+        stale_seconds = stale_after.as_secs(),
+        error_sleep_seconds = error_sleep.as_secs(),
+        request_timeout_seconds = request_timeout.as_secs(),
+        "Telegram polling started"
+    );
 
     loop {
-        let updates = match bot
+        maybe_log_polling_heartbeat(
+            &mut next_heartbeat_at,
+            heartbeat_interval,
+            last_update_id,
+            last_successful_get_updates_at,
+            last_processed_update_at,
+        );
+
+        if last_successful_get_updates_at.elapsed() > stale_after {
+            error!(
+                last_update_id = last_update_id
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                seconds_since_success = last_successful_get_updates_at.elapsed().as_secs(),
+                "Telegram polling stale, shutting down for systemd restart"
+            );
+            return Err(AppError::Other(
+                "Telegram polling stale, shutting down for systemd restart".to_string(),
+            ));
+        }
+
+        let request = bot
             .get_updates()
             .offset(offset)
             .limit(50)
-            .timeout(30)
-            .send()
-            .await
-        {
-            Ok(updates) => updates,
-            Err(error) => {
-                error!("Telegram get_updates failed: {error}");
-                sleep(Duration::from_secs(5)).await;
+            .timeout(GET_UPDATES_LONG_POLL_TIMEOUT_SECONDS)
+            .send();
+        let updates = match timeout(request_timeout, request).await {
+            Ok(Ok(updates)) => {
+                last_successful_get_updates_at = Instant::now();
+                consecutive_permanent_errors = 0;
+                updates
+            }
+            Ok(Err(error)) => match classify_polling_error(error, error_sleep) {
+                PollingErrorDisposition::Retry { sleep_for, context } => {
+                    warn!("{context}");
+                    sleep(sleep_for).await;
+                    continue;
+                }
+                PollingErrorDisposition::Permanent { context } => {
+                    consecutive_permanent_errors += 1;
+                    error!(
+                        consecutive_permanent_errors,
+                        "Telegram polling permanent error: {context}"
+                    );
+
+                    if consecutive_permanent_errors >= PERMANENT_POLLING_ERROR_THRESHOLD {
+                        error!("Telegram polling fatal error, shutting down: {context}");
+                        return Err(AppError::Other(context));
+                    }
+
+                    sleep(error_sleep).await;
+                    continue;
+                }
+                PollingErrorDisposition::Fatal { context } => {
+                    error!("Telegram polling fatal error, shutting down: {context}");
+                    return Err(AppError::Other(context));
+                }
+            },
+            Err(_) => {
+                warn!(
+                    timeout_seconds = request_timeout.as_secs(),
+                    "Telegram getUpdates temporary error, retrying: request timed out"
+                );
+                sleep(error_sleep).await;
                 continue;
             }
         };
 
         for update in updates {
+            last_update_id = Some(update.id.0);
+            last_processed_update_at = Some(Instant::now());
             offset = next_offset(&update);
 
             let Some(message) = extract_message(update) else {
@@ -101,6 +193,101 @@ pub async fn run(
             }
         }
     }
+}
+
+fn maybe_log_polling_heartbeat(
+    next_heartbeat_at: &mut Instant,
+    heartbeat_interval: Duration,
+    last_update_id: Option<u32>,
+    last_successful_get_updates_at: Instant,
+    last_processed_update_at: Option<Instant>,
+) {
+    let now = Instant::now();
+    if now < *next_heartbeat_at {
+        return;
+    }
+
+    info!(
+        last_update_id = last_update_id
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        seconds_since_successful_get_updates = last_successful_get_updates_at.elapsed().as_secs(),
+        seconds_since_processed_update = last_processed_update_at
+            .map(|value| value.elapsed().as_secs().to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
+        "Telegram polling alive"
+    );
+
+    *next_heartbeat_at = now + heartbeat_interval;
+}
+
+fn classify_polling_error(error: RequestError, default_sleep: Duration) -> PollingErrorDisposition {
+    match error {
+        RequestError::RetryAfter(seconds) => PollingErrorDisposition::Retry {
+            sleep_for: Duration::from_secs(seconds.seconds().max(1).into()),
+            context: format!(
+                "Telegram getUpdates temporary error, retrying: retry after {} seconds",
+                seconds.seconds()
+            ),
+        },
+        RequestError::Network(network_error) => PollingErrorDisposition::Retry {
+            sleep_for: default_sleep,
+            context: format!(
+                "Telegram getUpdates temporary error, retrying: {}",
+                describe_network_error(&network_error)
+            ),
+        },
+        RequestError::InvalidJson { raw, source } if invalid_json_looks_temporary(&raw) => {
+            PollingErrorDisposition::Retry {
+                sleep_for: default_sleep,
+                context: format!(
+                    "Telegram getUpdates temporary error, retrying: invalid JSON from Telegram ({source})"
+                ),
+            }
+        }
+        RequestError::Api(ApiError::InvalidToken) => PollingErrorDisposition::Fatal {
+            context: "Telegram polling fatal error, shutting down: invalid bot token".to_string(),
+        },
+        RequestError::Api(ApiError::CantGetUpdates) => PollingErrorDisposition::Fatal {
+            context:
+                "Telegram polling fatal error, shutting down: webhook is active for this bot"
+                    .to_string(),
+        },
+        RequestError::Api(ApiError::TerminatedByOtherGetUpdates) => {
+            PollingErrorDisposition::Fatal {
+                context:
+                    "Telegram polling fatal error, shutting down: another getUpdates consumer is running"
+                        .to_string(),
+            }
+        }
+        other => PollingErrorDisposition::Permanent {
+            context: other.to_string(),
+        },
+    }
+}
+
+fn describe_network_error(error: &reqwest_011::Error) -> String {
+    if error.is_timeout() {
+        format!("network timeout: {error}")
+    } else if error.is_connect() {
+        format!("network connect error: {error}")
+    } else if error.is_request() {
+        format!("network request error: {error}")
+    } else if error.is_body() {
+        format!("network body read error: {error}")
+    } else {
+        format!("network error: {error}")
+    }
+}
+
+fn invalid_json_looks_temporary(raw: &str) -> bool {
+    let normalized = raw.trim().to_ascii_lowercase();
+    normalized.starts_with('<')
+        || normalized.contains("bad gateway")
+        || normalized.contains("gateway timeout")
+        || normalized.contains("service unavailable")
+        || normalized.contains("internal server error")
+        || normalized.contains("<html")
 }
 
 async fn handle_command(
@@ -1098,4 +1285,36 @@ fn public_identifier(msg: &Message) -> String {
         .username()
         .map(|username| format!("@{username}"))
         .unwrap_or_else(|| msg.chat.id.0.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_html_json_is_treated_as_temporary() {
+        assert!(invalid_json_looks_temporary(
+            "<html><title>502 Bad Gateway</title></html>"
+        ));
+    }
+
+    #[test]
+    fn invalid_token_is_a_fatal_polling_error() {
+        let disposition = classify_polling_error(
+            RequestError::Api(ApiError::InvalidToken),
+            Duration::from_secs(5),
+        );
+
+        assert!(matches!(disposition, PollingErrorDisposition::Fatal { .. }));
+    }
+
+    #[test]
+    fn conflict_get_updates_is_a_fatal_polling_error() {
+        let disposition = classify_polling_error(
+            RequestError::Api(ApiError::TerminatedByOtherGetUpdates),
+            Duration::from_secs(5),
+        );
+
+        assert!(matches!(disposition, PollingErrorDisposition::Fatal { .. }));
+    }
 }

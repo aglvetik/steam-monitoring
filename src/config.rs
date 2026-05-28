@@ -24,6 +24,9 @@ pub struct Config {
     pub steamdb_timeout_seconds: u64,
     pub check_interval_minutes: u64,
     pub run_startup_check: bool,
+    pub telegram_polling_heartbeat_seconds: u64,
+    pub telegram_polling_error_sleep_seconds: u64,
+    pub telegram_polling_stale_seconds: u64,
     pub database_url: String,
     pub rust_log: String,
 }
@@ -101,6 +104,21 @@ impl Config {
                 )
             })
             .unwrap_or(false);
+        let telegram_polling_heartbeat_seconds = env::var("TELEGRAM_POLLING_HEARTBEAT_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(300);
+        let telegram_polling_error_sleep_seconds = env::var("TELEGRAM_POLLING_ERROR_SLEEP_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(5);
+        let telegram_polling_stale_seconds = env::var("TELEGRAM_POLLING_STALE_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(600);
         let database_url =
             env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://data/bot.sqlite".to_string());
         let rust_log = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
@@ -124,6 +142,9 @@ impl Config {
             steamdb_timeout_seconds,
             check_interval_minutes,
             run_startup_check,
+            telegram_polling_heartbeat_seconds,
+            telegram_polling_error_sleep_seconds,
+            telegram_polling_stale_seconds,
             database_url,
             rust_log,
         })

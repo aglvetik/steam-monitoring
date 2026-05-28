@@ -125,6 +125,9 @@ Fill in the values you need:
 | `STEAMDB_TIMEOUT_SECONDS` | HTTP timeout for SteamDB page fetch |
 | `CHECK_INTERVAL_MINUTES` | Scheduler interval in minutes |
 | `RUN_STARTUP_CHECK` | If `true`, run a Steam check immediately on startup |
+| `TELEGRAM_POLLING_HEARTBEAT_SECONDS` | Interval for Telegram polling heartbeat logs |
+| `TELEGRAM_POLLING_ERROR_SLEEP_SECONDS` | Sleep between recoverable Telegram polling errors |
+| `TELEGRAM_POLLING_STALE_SECONDS` | If there is no successful `getUpdates` for longer than this, the bot exits so systemd can restart it |
 | `DATABASE_URL` | SQLite URL, default `sqlite://data/bot.sqlite`. On VPS prefer an absolute path such as `sqlite:///opt/steam-monitoring/steam-monitoring/data/bot.sqlite` |
 | `RUST_LOG` | Log level, for example `info` |
 
@@ -328,6 +331,10 @@ The wrapper script clears stale pending Telegram updates at startup with
 `deleteWebhook?drop_pending_updates=true`. This prevents a restart storm where
 old queued `/check_now` commands would otherwise run one after another after
 downtime.
+
+The systemd example also keeps `Restart=always` and `RuntimeMaxSec=10800`, so
+the service is restarted both after fatal polling errors and after a long
+runtime window.
 
 ## Useful manual tests
 

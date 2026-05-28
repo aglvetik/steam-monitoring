@@ -16,7 +16,7 @@ use reqwest_011::Client as TelegramHttpClient;
 use scheduler::{spawn_scheduler, CheckRunner};
 use sqlx::SqlitePool;
 use teloxide::Bot;
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -82,7 +82,18 @@ async fn main() -> AppResult<()> {
     );
 
     info!("steam-free-games-bot started");
-    telegram::bot::run(bot, repo, config, steam_client, check_runner).await
+    match telegram::bot::run(bot, repo, config, steam_client, check_runner).await {
+        Ok(()) => {
+            error!("Telegram polling exited unexpectedly");
+            Err(AppError::Other(
+                "Telegram polling exited unexpectedly".to_string(),
+            ))
+        }
+        Err(error) => {
+            error!("Telegram polling fatal error, shutting down: {error}");
+            Err(error)
+        }
+    }
 }
 
 fn init_tracing(default_level: &str) {

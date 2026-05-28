@@ -9,7 +9,7 @@ WorkingDirectory=/opt/steam-monitoring/steam-monitoring
 ExecStart=/opt/steam-monitoring/steam-monitoring/scripts/start-bot.sh
 Restart=always
 RestartSec=10
-RuntimeMaxSec=86400
+RuntimeMaxSec=10800
 Environment=RUST_LOG=info
 
 [Install]
